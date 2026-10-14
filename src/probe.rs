@@ -119,16 +119,20 @@ pub fn locate(sock: &Path, fill: [u8; 3], output: &str) -> Option<Found> {
     // let the terminal draw it (TUI_SHIM_PROBE_DELAY_MS raises this for slow test sessions)
     let delay = std::env::var("TUI_SHIM_PROBE_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(140);
     std::thread::sleep(Duration::from_millis(delay));
-    // the marker may not be on screen yet if the terminal is slow: look twice
+    // the marker may not be on screen yet (the editor can still be starting up): look a few
+    // times, asking again each time; the caller gives up after its own overall time limit
     let mut marker = None;
-    for attempt in 0..2 {
+    for attempt in 0..4 {
+        if attempt > 0 {
+            let _ = UnixDatagram::unbound().ok()?.send_to(PROBE, sock);
+        }
         let shot = Command::new("grim").args(["-o", output, "-t", "ppm", "-"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
         marker = find_marker(&shot.stdout, fill);
         crate::log(&format!("probe: attempt {attempt}: grim exit={:?} bytes={} marker bbox={marker:?}", shot.status.code(), shot.stdout.len()));
         if marker.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(250));
     }
     let (l, t, r, _b) = marker?;
     let _ = l;

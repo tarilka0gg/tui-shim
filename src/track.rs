@@ -58,8 +58,9 @@ fn save_gap(g: i64) {
 /// niri reports no position for tiled windows, but it does report each window's column,
 /// row and size. If the whole strip of columns fits on the monitor it is not scrolled, so the
 /// position follows from the widths and the gap (inferred when the columns fill the screen,
-/// else the last inferred value). If the strip overflows, niri keeps the focused column in
-/// view: the last column sits flush right, the first flush left; a middle one is unknown.
+/// else the last inferred value). If the strip overflows it is scrolled by an amount niri does
+/// not report (a column can end up anywhere, even with empty space beside it): return None and
+/// let the caller find the window another way.
 fn tiled_pos(w: &Value, all: &[Value], out_w: i64) -> Option<(i64, i64)> {
     use std::collections::BTreeMap;
     let pos = &w["layout"]["pos_in_scrolling_layout"];
@@ -87,15 +88,10 @@ fn tiled_pos(w: &Value, all: &[Value], out_w: i64) -> Option<(i64, i64)> {
     }
     let gap = inferred.unwrap_or_else(saved_gap);
     let overflow = sum + (n + 1) * gap > out_w + 2;
-    let x = if !overflow {
-        gap + cols.range(..col).map(|(_, c)| c.0 + gap).sum::<i64>()
-    } else if Some(&col) == cols.keys().next_back() {
-        out_w - gap - my_w
-    } else if Some(&col) == cols.keys().next() {
-        gap
-    } else {
+    if overflow {
         return None;
-    };
+    }
+    let x = gap + cols.range(..col).map(|(_, c)| c.0 + gap).sum::<i64>();
     let mut rows = cols.get(&col)?.1.clone();
     rows.sort();
     let y = gap + rows.iter().filter(|(r, _)| *r < row).map(|(_, h)| h + gap).sum::<i64>();
