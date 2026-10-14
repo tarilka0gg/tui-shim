@@ -1,6 +1,8 @@
 [package]
 name = "tui-shim"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
+description = "Makes terminal (TUI) apps behave like desktop apps: launchers, icons, palette theming and an editor file picker"
 edition = "2024"
 
 [dependencies]

@@ -6,7 +6,8 @@
 **Editor file picker.** In a terminal (ghostty), micro and nvim get a small round folder badge in the window's top-right corner.
 Click it (or press F9) for a native file browser; the chosen file opens in the same editor window. With no file given the picker
 opens by itself. Enabled by `tui-shim shims install` (puts `micro`/`nvim` shims in `~/.local/bin`) or by the launcher entries.
-Details, limits and the design rationale are in `docs/INTEGRATION.md`.
+The picker's filter ignores case (`DEsktop` finds `Desktop`, `desktop`, `DeSKtop`...), ranks exact and prefix matches first and
+searches sub-folders too. Details, limits and the design rationale are in `docs/INTEGRATION.md`.
 
 Scans for known TUI apps (btop, htop, yazi, micro, nvim, tmux, ...), then for each one:
 
@@ -40,3 +41,11 @@ Default palette: `~/.config/futuro-darko/palette.md` (markdown tables of `name |
 
 Apps are described in `registry/*.toml`; theme templates live in `templates/` with `{{palette_key}}` placeholders.
 Config files tui-shim edits are backed up once as `*.bak-tui-shim`; files not created by it are skipped without `--force`.
+
+## Build
+Rust 2024 edition. GTK4, libadwaita and gtk4-layer-shell (for the picker) are optional: `cargo build --release --no-default-features`
+builds the launcher/theme tooling without them. The badge needs a terminal with the kitty graphics protocol (ghostty, kitty);
+opening the picker next to a scrolled niri window uses `grim`. A Gentoo live ebuild is in `packaging/gentoo/`.
+
+## License
+GPL-3.0-or-later, see [LICENSE](LICENSE). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
