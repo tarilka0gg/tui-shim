@@ -35,6 +35,37 @@ pub fn push_recent(home: &Path, file: &Path) {
     }
 }
 
+/// Where the user left off in the picker: kept on disk so a new editor window resumes there.
+#[derive(Clone, Default, Debug)]
+pub struct View {
+    pub dir: Option<PathBuf>,
+    pub scroll: Option<f64>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ViewFile {
+    dir: Option<String>,
+    scroll: Option<f64>,
+}
+
+fn view_path(home: &Path) -> PathBuf {
+    home.join(".config/tui-shim/view.toml")
+}
+
+pub fn load_view(home: &Path) -> View {
+    let v: ViewFile = std::fs::read_to_string(view_path(home)).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default();
+    View { dir: v.dir.map(PathBuf::from).filter(|d| d.is_dir()), scroll: v.scroll }
+}
+
+pub fn save_view(home: &Path, v: &View) {
+    let p = view_path(home);
+    let _ = std::fs::create_dir_all(p.parent().unwrap());
+    let f = ViewFile { dir: v.dir.as_ref().map(|d| d.to_string_lossy().into_owned()), scroll: v.scroll };
+    if let Ok(s) = toml::to_string_pretty(&f) {
+        let _ = std::fs::write(p, s);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Dir,
@@ -161,6 +192,19 @@ mod tests {
         assert_eq!(c[0].label, "alpha.txt");
         assert_eq!(c.last().unwrap().kind, Kind::New);
         assert_eq!(view(&d, &d, false, false, "").len(), 2);
+    }
+
+    #[test]
+    fn view_roundtrip() {
+        let home = std::env::temp_dir().join("tui-shim-view-test");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        save_view(&home, &View { dir: Some(home.join("sub")), scroll: Some(123.5) });
+        let v = load_view(&home);
+        assert_eq!(v.dir, Some(home.join("sub")));
+        assert_eq!(v.scroll, Some(123.5));
+        std::fs::remove_dir_all(home.join("sub")).unwrap();
+        assert!(load_view(&home).dir.is_none(), "a folder that no longer exists is forgotten");
     }
 
     #[test]

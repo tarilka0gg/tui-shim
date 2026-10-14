@@ -372,7 +372,9 @@ fn focus_in_entry(w: &impl IsA<gtk::Widget>) -> bool {
 
 /// Thunar-style file browser: nav buttons + path bar on top, search, and a grid of icon tiles.
 /// Returns the widget, the widget to focus when it becomes visible, and a refresh hook.
-fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>>, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, Rc<dyn Fn()>, Rc<dyn Fn()>) {
+/// Returns the widget, a focus hook, a refresh hook and a snapshot hook (current folder and scroll
+/// offset, for resuming later). `scroll` is restored on the first fill when there is no file to reveal.
+fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>>, scroll: Rc<Cell<Option<f64>>>, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, Rc<dyn Fn()>, Rc<dyn Fn()>, Rc<dyn Fn() -> (PathBuf, f64)>) {
     let nav = Rc::new(RefCell::new(Nav { dir: start, back: vec![], fwd: vec![], hidden: false, recent: false }));
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -401,7 +403,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
 
     let refresh: Rc<dyn Fn(Slide)> = {
         let (nav, entries, grid, filter, path, back_b, fwd_b, up_b, home) = (nav.clone(), entries.clone(), grid.clone(), filter.clone(), path.clone(), back_b.clone(), fwd_b.clone(), up_b.clone(), home.clone());
-        let reveal = reveal.clone();
+        let (reveal, scroll) = (reveal.clone(), scroll.clone());
         Rc::new(move |slide: Slide| {
             let flow = grid.hidden_flow().clone();
             flow.remove_all();
@@ -439,12 +441,18 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
             if let (Some(c), true) = (chosen, at.is_some()) {
                 // wait for the layout (and the panel's slide-in) before centring the tile
                 let grid = grid.clone();
-                glib::timeout_add_local_once(Duration::from_millis(280), move || {
+                glib::timeout_add_local_once(Duration::from_millis(90), move || {
                     if let Some(b) = c.compute_bounds(grid.flow()) {
                         let adj = grid.scroller().vadjustment();
                         adj.set_value(b.y() as f64 - (adj.page_size() - b.height() as f64) / 2.0);
                     }
                 });
+            } else if at.is_none() {
+                if let Some(v) = scroll.take() {
+                    // back to exactly where the list was scrolled to last time
+                    let grid = grid.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(90), move || grid.scroller().vadjustment().set_value(v));
+                }
             }
         })
     };
@@ -682,7 +690,11 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
             }
         })
     };
-    (root, focus, refresh_plain)
+    let snapshot: Rc<dyn Fn() -> (PathBuf, f64)> = {
+        let (nav, grid) = (nav.clone(), grid.clone());
+        Rc::new(move || (nav.borrow().dir.clone(), grid.scroller().vadjustment().value()))
+    };
+    (root, focus, refresh_plain, snapshot)
 }
 
 // -------------------------------------------------------------------- overlay
@@ -699,12 +711,6 @@ pub struct OverlayCfg {
 fn monitor_by_name(name: &str) -> Option<gdk::Monitor> {
     let mons = gdk::Display::default()?.monitors();
     (0..mons.n_items()).filter_map(|i| mons.item(i)?.downcast::<gdk::Monitor>().ok()).find(|m| m.connector().as_deref() == Some(name))
-}
-
-/// Logical size of the monitor `name` (or the first one): the full-screen surface is that size.
-fn screen_size(name: Option<&str>) -> (f64, f64) {
-    let mon = name.and_then(monitor_by_name).or_else(|| gdk::Display::default()?.monitors().item(0)?.downcast::<gdk::Monitor>().ok());
-    mon.map(|m| (m.geometry().width() as f64, m.geometry().height() as f64)).unwrap_or((1280.0, 800.0))
 }
 
 /// Folder button pinned (via layer-shell) to the top-right of the tracked editor window.
@@ -768,7 +774,7 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
             *rv.borrow_mut() = Some(p.clone()); // next time the panel opens on this file
             on_pick(p);
         });
-        let (panel, focus, refresh) = file_panel(home.clone(), start, reveal.clone(), picked, collapse.clone());
+        let (panel, focus, refresh, _snapshot) = file_panel(home.clone(), start, reveal.clone(), Rc::new(Cell::new(None)), picked, collapse.clone());
         panel.add_css_class("tui-panel");
         panel.set_width_request(540);
         let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).transition_duration(220).child(&panel).build();
@@ -922,7 +928,8 @@ pub fn usable_areas() -> Vec<(String, i32, i32)> {
 }
 
 /// The picker as a popup, opened by a click on the badge drawn inside the terminal.
-/// No persistent window: the panel is created on a click and removed when it closes.
+/// No persistent window: a small window beside the editor is created on a click and removed when
+/// it closes. It opens at once (no pointer to wait for), fades in, and resumes where you left off.
 pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
     let OverlayCfg { home, start, pal, on_pick, expand_on_start } = cfg;
     let rx = Rc::new(rx);
@@ -933,25 +940,27 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
             prov.load_from_string(OVERLAY_CSS);
             gtk::style_context_add_provider_for_display(&display, &prov, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
         }
-        let last = files::recent(&home).into_iter().next();
-        let start = last.as_ref().and_then(|l| l.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| start.clone());
-        let reveal: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(last));
+        // where the user left off, shared by every panel and every editor window (saved on disk)
+        let mut saved = files::load_view(&home);
+        if saved.dir.is_none() {
+            saved.dir = files::recent(&home).into_iter().next().and_then(|l| l.parent().map(|p| p.to_path_buf())).or_else(|| Some(start.clone()));
+        }
+        let view = Rc::new(RefCell::new(saved));
+        let picked_file: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None)); // select it next time
         // (right margin, top margin, window right edge x, position known, monitor)
         let geometry: Rc<RefCell<(i32, i32, i32, bool, Option<String>)>> = Rc::new(RefCell::new((10, 10, 0, false, None)));
         let open: Rc<RefCell<Option<gtk::ApplicationWindow>>> = Rc::new(RefCell::new(None));
-
-        // `at_pointer`: opened by a mouse click on the badge, so the pointer marks where the badge is
-        let toggle_slot: Rc<RefCell<Option<Rc<dyn Fn(bool)>>>> = Rc::new(RefCell::new(None));
         let opened_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
-        // how to close the panel that is open right now (animated, and forgets the window)
+        // how to close the panel that is open right now (fades out, remembers the view, forgets the window)
         let close_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
-        let toggle: Rc<dyn Fn(bool)> = {
-            let (app, home, start, reveal, geometry, open, on_pick, toggle_slot, opened_at, close_slot) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone(), toggle_slot.clone(), opened_at.clone(), close_slot.clone());
-            Rc::new(move |at_pointer: bool| {
+
+        let toggle: Rc<dyn Fn()> = {
+            let (app, home, view, picked_file, geometry, open, on_pick, opened_at, close_slot) =
+                (app.clone(), home.clone(), view.clone(), picked_file.clone(), geometry.clone(), open.clone(), on_pick.clone(), opened_at.clone(), close_slot.clone());
+            Rc::new(move || {
                 if open.borrow().is_some() {
                     // a second click while the panel is still appearing is the same click, not "close"
-                    if opened_at.get().elapsed() > Duration::from_millis(900) {
-                        crate::log("badge click while open -> closing");
+                    if opened_at.get().elapsed() > Duration::from_millis(700) {
                         let c = close_slot.borrow().clone();
                         if let Some(c) = c {
                             c();
@@ -959,59 +968,80 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     }
                     return;
                 }
-                if at_pointer || opened_at.get().elapsed() > Duration::from_millis(900) {
-                    opened_at.set(Instant::now());
-                }
-                // a transparent full-screen surface holds the panel: it can read the pointer position
-                // (the compositor will not tell us where a tiled window is) and catches click-away
+                opened_at.set(Instant::now());
+                const PANEL_W: i32 = 540;
+                const INSET: i32 = 50; // from the window's top and right borders
+                const MARGIN: i32 = 10; // the panel's own margin: its visible edge is this far inside
+                let (right, top, edge_x, exact, monitor) = geometry.borrow().clone();
+                crate::log(&format!("open panel: exact={exact} right={right} top={top} edge_x={edge_x} monitor={monitor:?}"));
+
+                // a small window anchored beside the editor (not full-screen: nothing else is blocked)
                 let win = gtk::ApplicationWindow::builder().application(&app).decorated(false).resizable(false).css_classes(["tui-overlay"]).build();
                 win.init_layer_shell();
                 win.set_layer(Layer::Overlay);
-                for e in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
-                    win.set_anchor(e, true);
-                }
-                // pointer mode: output coordinates (matches the pointer); otherwise the usable area,
-                // which is what the layout estimate is measured in
-                win.set_exclusive_zone(if at_pointer { -1 } else { 0 });
                 win.set_keyboard_mode(KeyboardMode::OnDemand);
                 win.set_namespace(Some("tui-shim-panel"));
-                let (right, top, _edge_x, exact, monitor) = geometry.borrow().clone();
-                let screen = screen_size(monitor.as_deref());
-                crate::log(&format!("open panel: at_pointer={at_pointer} exact={exact} right={right} top={top} monitor={monitor:?} screen={screen:?}"));
+                win.set_anchor(Edge::Top, true);
+                if exact && edge_x >= PANEL_W + 100 {
+                    win.set_anchor(Edge::Right, true);
+                    win.set_margin(Edge::Right, (right - 10 + INSET - MARGIN).max(0));
+                    win.set_margin(Edge::Top, (top - 10 + INSET - MARGIN).max(0));
+                } else if exact {
+                    // narrow window near the left edge: grow rightwards instead
+                    win.set_anchor(Edge::Left, true);
+                    win.set_margin(Edge::Left, (edge_x - INSET - MARGIN - PANEL_W).max(0));
+                    win.set_margin(Edge::Top, (top - 10 + INSET - MARGIN).max(0));
+                } else {
+                    win.set_margin(Edge::Top, 80); // position unknown: centred near the top
+                }
                 if let Some(mon) = monitor.as_deref().and_then(monitor_by_name) {
                     win.set_monitor(Some(&mon));
                 }
+
+                let snap_slot: Rc<RefCell<Option<Rc<dyn Fn() -> (PathBuf, f64)>>>> = Rc::new(RefCell::new(None));
                 let rev_slot: Rc<RefCell<Option<gtk::Revealer>>> = Rc::new(RefCell::new(None));
                 let close: Rc<dyn Fn()> = {
-                    let (win, rev_slot, open) = (win.clone(), rev_slot.clone(), open.clone());
+                    let (win, rev_slot, snap_slot, open, view, home) = (win.clone(), rev_slot.clone(), snap_slot.clone(), open.clone(), view.clone(), home.clone());
                     Rc::new(move || {
                         if open.borrow().is_none() {
                             return;
                         }
+                        // remember the folder and scroll position for the next time
+                        let snap = snap_slot.borrow().clone();
+                        if let Some(snap) = snap {
+                            let (dir, scroll) = snap();
+                            let v = files::View { dir: Some(dir), scroll: Some(scroll) };
+                            files::save_view(&home, &v);
+                            *view.borrow_mut() = v;
+                        }
                         if let Some(r) = rev_slot.borrow().as_ref() {
-                            r.set_reveal_child(false);
+                            r.set_reveal_child(false); // fade out
                         }
                         open.borrow_mut().take();
                         let win = win.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(240), move || win.close());
+                        glib::timeout_add_local_once(Duration::from_millis(200), move || win.close());
                     })
                 };
-                let (c, h, rv, op) = (close.clone(), home.clone(), reveal.clone(), on_pick.clone());
+                let (c, h, pf, op) = (close.clone(), home.clone(), picked_file.clone(), on_pick.clone());
                 let picked: PickFn = Rc::new(move |p| {
                     files::push_recent(&h, &p);
-                    *rv.borrow_mut() = Some(p.clone()); // next time the panel opens on this file
+                    *pf.borrow_mut() = Some(p.clone()); // next time the panel opens on this file
                     op(p);
                     c();
                 });
-                let (panel, focus, refresh) = file_panel(home.clone(), start.clone(), reveal.clone(), picked, close.clone());
+                let (start_dir, scroll) = {
+                    let v = view.borrow();
+                    (v.dir.clone().unwrap_or_else(|| home.clone()), v.scroll)
+                };
+                let reveal = Rc::new(RefCell::new(picked_file.borrow_mut().take()));
+                let (panel, focus, refresh, snapshot) = file_panel(home.clone(), start_dir, reveal, Rc::new(Cell::new(scroll)), picked, close.clone());
+                *snap_slot.borrow_mut() = Some(snapshot);
                 panel.add_css_class("tui-panel");
-                const PANEL_W: f64 = 540.0;
-                panel.set_width_request(PANEL_W as i32);
-                let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).transition_duration(220).child(&panel).visible(false).build();
+                panel.set_width_request(PANEL_W);
+                // a plain fade: sliding from the top edge showed its first frames beside the window
+                let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::Crossfade).transition_duration(160).child(&panel).build();
                 *rev_slot.borrow_mut() = Some(rev.clone());
-                let fixed = gtk::Fixed::new();
-                fixed.put(&rev, 0.0, 0.0);
-                win.set_child(Some(&fixed));
+                win.set_child(Some(&rev));
                 *open.borrow_mut() = Some(win.clone());
                 *close_slot.borrow_mut() = Some(close.clone());
                 {
@@ -1029,118 +1059,37 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     let (close, w) = (close.clone(), win.clone());
                     let seen = Cell::new(false);
                     win.connect_is_active_notify(move |win| {
-                        crate::log(&format!("panel is_active={}", win.is_active()));
                         if win.is_active() {
                             seen.set(true);
                         } else if seen.get() {
                             let (close, w) = (close.clone(), w.clone());
                             glib::timeout_add_local_once(Duration::from_millis(250), move || {
                                 if !w.is_active() {
-                                    crate::log("panel lost focus -> closing");
                                     close();
                                 }
                             });
                         }
                     });
                 }
-
-                // pointer position inside the full-screen surface = output coordinates
-                let pointer: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-                // debugging aid: pretend the pointer is at x,y (the nested test session has no pointer)
-                if let Some((x, y)) = std::env::var("TUI_SHIM_FAKE_POINTER").ok().and_then(|v| v.split_once(',').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))) {
-                    pointer.set(Some((x, y)));
-                }
-                let motion = gtk::EventControllerMotion::new();
-                {
-                    let p = pointer.clone();
-                    motion.connect_enter(move |_, x, y| {
-                        crate::log(&format!("pointer enter ({x:.0},{y:.0})"));
-                        p.set(Some((x, y)));
-                    });
-                }
-                {
-                    let p = pointer.clone();
-                    motion.connect_motion(move |_, x, y| {
-                        if p.get().is_none() {
-                            p.set(Some((x, y)));
-                        }
-                    });
-                }
-                win.add_controller(motion);
-                // a click outside the panel closes it
-                let away = gtk::GestureClick::new();
-                away.set_propagation_phase(gtk::PropagationPhase::Capture);
-                {
-                    let (rev, fixed, close) = (rev.clone(), fixed.clone(), close.clone());
-                    away.connect_pressed(move |_, _, x, y| {
-                        crate::log(&format!("press on the overlay surface at ({x:.0},{y:.0})"));
-                        let inside = rev.compute_bounds(&fixed).is_some_and(|b| b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)));
-                        if !inside {
-                            close();
-                        }
-                    });
-                }
-                fixed.add_controller(away);
-
-                let remembered = reveal.borrow().clone(); // file to select again if we have to reopen
                 refresh();
                 win.present();
-                // place the panel once the pointer has been seen (mouse click) or the surface is up
-                const INSET: f64 = 50.0; // distance from the window's top and right borders
-                const MARGIN: f64 = 10.0; // the panel's own margin: its visible edge is this far inside the box
-                let (win2, fixed2, rev2, slot2, open2, reveal2) = (win.clone(), fixed.clone(), rev.clone(), toggle_slot.clone(), open.clone(), reveal.clone());
-                let began = Instant::now();
-                glib::timeout_add_local(Duration::from_millis(60), move || {
-                    let (sw, sh) = screen;
-                    let place = |x: f64, y: f64| {
-                        fixed2.move_(&rev2, x.clamp(8.0, (sw - PANEL_W - 8.0).max(8.0)), y.clamp(8.0, (sh - 440.0).max(8.0)));
-                        rev2.set_visible(true);
-                        rev2.set_reveal_child(true);
-                        focus();
-                    };
-                    if at_pointer {
-                        match pointer.get() {
-                            // pointer sits on the badge, which is about 29px in from the window's right
-                            // edge and 24px down from its top edge
-                            Some((px, py)) => {
-                                crate::log(&format!("pointer at ({px:.0},{py:.0}) -> panel placed from the pointer"));
-                                place(px + 29.0 - INSET - MARGIN - PANEL_W, py - 24.0 + INSET - MARGIN)
-                            }
-                            None if began.elapsed() < Duration::from_millis(150) => return glib::ControlFlow::Continue,
-                            None => {
-                                // the compositor never reported the pointer: use the layout estimate instead
-                                crate::log("no pointer event within 150ms -> using the layout estimate");
-                                open2.borrow_mut().take();
-                                win2.close();
-                                *reveal2.borrow_mut() = remembered.clone();
-                                if let Some(t) = slot2.borrow().clone() {
-                                    t(false);
-                                }
-                            }
-                        }
-                    } else if exact {
-                        place(sw - (right - 10).max(0) as f64 - INSET - MARGIN - PANEL_W, (top - 10).max(0) as f64 + INSET - MARGIN);
-                    } else {
-                        place((sw - PANEL_W) / 2.0, 80.0);
-                    }
-                    glib::ControlFlow::Break
-                });
+                rev.set_reveal_child(true);
+                glib::idle_add_local_once(move || focus());
             })
         };
 
-        *toggle_slot.borrow_mut() = Some(toggle.clone());
         let (app2, started) = (app.clone(), Cell::new(!expand_on_start));
-        glib::timeout_add_local(Duration::from_millis(80), move || {
+        // short poll: a click should show the panel without a perceptible delay
+        glib::timeout_add_local(Duration::from_millis(15), move || {
             while let Ok(m) = rx.try_recv() {
                 match m {
                     Msg::Show { right, top, edge_x, exact, monitor } => {
                         *geometry.borrow_mut() = (right, top, edge_x, exact, monitor);
                         if !started.replace(true) {
-                            toggle(false); // an editor with no file yet: offer the picker right away
+                            toggle(); // an editor with no file yet: offer the picker right away
                         }
                     }
-                    Msg::Click => toggle(true),
-                    Msg::Hotkey => toggle(false),
+                    Msg::Click | Msg::Hotkey => toggle(),
                     Msg::Hide => {}
                     Msg::Quit => {
                         app2.quit();
