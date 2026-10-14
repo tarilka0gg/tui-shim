@@ -1,5 +1,13 @@
 # tui-shim
 
+> **Integrating this into Simple Linux / the ISO? Read [docs/INTEGRATION.md](docs/INTEGRATION.md) first.**
+> It explains how everything works, what must not be forgotten and how to package it.
+
+**Editor file picker.** In a terminal (ghostty), micro and nvim get a small round folder badge in the window's top-right corner.
+Click it (or press F9) for a native file browser; the chosen file opens in the same editor window. With no file given the picker
+opens by itself. Enabled by `tui-shim shims install` (puts `micro`/`nvim` shims in `~/.local/bin`) or by the launcher entries.
+Details, limits and the design rationale are in `docs/INTEGRATION.md`.
+
 Scans for known TUI apps (btop, htop, yazi, micro, nvim, tmux, ...), then for each one:
 
 - writes a launcher `.desktop` entry that opens it in your terminal with its own window class
@@ -13,7 +21,9 @@ tui-shim theme [APP]          # themes only
 tui-shim clean                # remove only entries/icons it created
 tui-shim choose [APP]         # pick system vs user-installed copy (floating picker)
 tui-shim edit [FILE] [--new]  # "Open with" editor picker, or start a new file
-tui-shim niri-rule            # window-rule snippet that floats the picker windows
+tui-shim open APP [FILE]      # start an editor with the badge/picker (what the launchers and shims call)
+tui-shim shims [install|remove|status]  # make plain `micro`/`nvim` use it
+tui-shim niri-rule            # optional window-rule snippet (not needed by the picker)
 tui-shim doctor
 ```
 
