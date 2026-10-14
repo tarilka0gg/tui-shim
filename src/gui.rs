@@ -602,7 +602,14 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         let (rx, on_pick, start) = (rx.clone(), on_pick.clone(), start.clone());
         if let Some(display) = gdk::Display::default() {
             let prov = gtk::CssProvider::new();
-            prov.load_from_string("window.tui-overlay { background: transparent; box-shadow: none; } .tui-panel { background: @window_bg_color; color: @window_fg_color; border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.35); } .tui-panel label, .tui-panel entry, .tui-panel text, .tui-panel button { color: @window_fg_color; }");
+            prov.load_from_string(
+                "window.tui-overlay { background: transparent; box-shadow: none; }\
+                 .tui-fab { background: @card_bg_color; color: @window_fg_color; border: 1px solid alpha(@window_fg_color, 0.25); border-radius: 999px; min-width: 24px; min-height: 24px; padding: 3px; opacity: 0.85; box-shadow: none; outline: none; }\
+                 .tui-fab:hover { opacity: 1; border-color: @accent_bg_color; }\
+                 .tui-fab:focus-visible { outline: none; }\
+                 .tui-panel { background: @window_bg_color; color: @window_fg_color; border: 1px solid alpha(@window_fg_color, 0.25); border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.35); }\
+                 .tui-panel label, .tui-panel entry, .tui-panel text, .tui-panel button { color: @window_fg_color; }",
+            );
             gtk::style_context_add_provider_for_display(&display, &prov, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
         }
         let win = gtk::ApplicationWindow::builder().application(app).decorated(false).resizable(false).css_classes(["tui-overlay"]).build();
@@ -610,17 +617,19 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         win.set_layer(Layer::Overlay);
         win.set_anchor(Edge::Top, true);
         win.set_anchor(Edge::Right, true);
-        win.set_keyboard_mode(KeyboardMode::OnDemand);
+        // no keyboard focus while collapsed, or the button would steal it from the editor
+        win.set_keyboard_mode(KeyboardMode::None);
         win.set_namespace(Some("tui-shim-overlay"));
 
         let touched = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
         let panel_slot: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
         let collapse: Rc<dyn Fn()> = {
-            let slot = panel_slot.clone();
+            let (slot, win) = (panel_slot.clone(), win.clone());
             Rc::new(move || {
                 if let Some(p) = slot.borrow().as_ref() {
                     p.set_visible(false);
                 }
+                win.set_keyboard_mode(KeyboardMode::None);
             })
         };
         let (c, t, h) = (collapse.clone(), touched.clone(), home.clone());
@@ -636,13 +645,14 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         panel.set_visible(false);
         *panel_slot.borrow_mut() = Some(panel.clone());
 
-        let toggle = gtk::Button::builder().icon_name("folder-open-symbolic").css_classes(["circular", "osd"]).halign(gtk::Align::End).tooltip_text("Open a file").build();
+        let toggle = gtk::Button::builder().icon_name("folder-open-symbolic").css_classes(["tui-fab"]).halign(gtk::Align::End).tooltip_text("Open a file").build();
         {
-            let (panel, focus, refresh, t) = (panel.clone(), focus.clone(), refresh.clone(), touched.clone());
+            let (panel, focus, refresh, t, win) = (panel.clone(), focus.clone(), refresh.clone(), touched.clone(), win.clone());
             toggle.connect_clicked(move |_| {
                 t.set(Instant::now());
                 let show = !panel.is_visible();
                 panel.set_visible(show);
+                win.set_keyboard_mode(if show { KeyboardMode::OnDemand } else { KeyboardMode::None });
                 if show {
                     refresh();
                     focus_first(&focus);
@@ -650,6 +660,23 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
             });
         }
         let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+        // any pointer or key activity on the overlay counts as "in use"
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion({
+            let t = touched.clone();
+            move |_, _, _| t.set(Instant::now())
+        });
+        root.add_controller(motion);
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let t = touched.clone();
+            move |_, _, _, _| {
+                t.set(Instant::now());
+                glib::Propagation::Proceed
+            }
+        });
+        root.add_controller(keys);
         root.append(&toggle);
         root.append(&panel);
         win.set_child(Some(&root));
@@ -658,10 +685,13 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         let auto_expand = Cell::new(expand_on_start || std::env::var_os("TUI_SHIM_OVERLAY_EXPANDED").is_some());
         let toggle2 = toggle.clone();
         let (w, app2, t) = (win.clone(), app.clone(), touched.clone());
+        // set while the editor is not focused; the overlay goes away once it has been idle a moment
+        let want_hidden: Cell<Option<Instant>> = Cell::new(None);
         glib::timeout_add_local(Duration::from_millis(80), move || {
             while let Ok(m) = rx.try_recv() {
                 match m {
                     Msg::Show { right, top, monitor } => {
+                        want_hidden.set(None);
                         w.set_margin(Edge::Right, right);
                         w.set_margin(Edge::Top, top);
                         if let Some(mon) = monitor.as_deref().and_then(monitor_by_name) {
@@ -675,17 +705,22 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                         }
                     }
                     Msg::Hide => {
-                        // clicking the overlay steals focus from the editor; don't vanish mid-use
-                        let in_use = w.is_active() || t.get().elapsed() < Duration::from_millis(800);
-                        if !in_use {
-                            collapse();
-                            w.set_visible(false);
+                        if want_hidden.get().is_none() {
+                            want_hidden.set(Some(Instant::now()));
                         }
                     }
                     Msg::Quit => {
                         app2.quit();
                         return glib::ControlFlow::Break;
                     }
+                }
+            }
+            // clicking the overlay takes focus from the editor, so only hide when it is idle
+            if let Some(since) = want_hidden.get() {
+                let in_use = w.is_active() || t.get().elapsed() < Duration::from_secs(3);
+                if w.is_visible() && since.elapsed() >= Duration::from_millis(600) && !in_use {
+                    collapse();
+                    w.set_visible(false);
                 }
             }
             glib::ControlFlow::Continue
