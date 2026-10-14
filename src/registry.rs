@@ -22,6 +22,11 @@ pub struct App {
     pub simple_icon: Option<String>,
     /// flag that prints the version (default --version)
     pub version_arg: Option<String>,
+    /// editor already has its own file picker (nvim): no picker before launch
+    #[serde(default)]
+    pub builtin_picker: bool,
+    /// "nvim": open files in the running instance through --listen/--server
+    pub remote: Option<String>,
     #[serde(default)]
     pub theme: Theme,
 }

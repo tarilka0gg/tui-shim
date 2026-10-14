@@ -142,7 +142,7 @@ mod tests {
         App {
             name: name.into(), title: name.into(), comment: String::new(),
             categories: vec![], keywords: vec![], icon_names: vec![],
-            dashboard_icon: dash.map(Into::into), simple_icon: gh.map(Into::into), version_arg: None,
+            dashboard_icon: dash.map(Into::into), simple_icon: gh.map(Into::into), version_arg: None, builtin_picker: false, remote: None,
             theme: Default::default(),
         }
     }

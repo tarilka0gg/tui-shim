@@ -1,10 +1,12 @@
 mod choices;
 mod desktop;
+mod files;
 #[cfg(feature = "gui")]
 mod gui;
 mod icons;
 mod palette;
 mod picker;
+mod track;
 mod registry;
 mod scan;
 mod theme;
@@ -74,6 +76,11 @@ enum Cmd {
         #[arg(long)]
         new: bool,
     },
+    /// Start an editor: file picker first if it has no browser of its own, folder overlay while it runs
+    Open {
+        app: String,
+        file: Option<PathBuf>,
+    },
     /// Print a niri window-rule that floats the picker windows
     NiriRule,
     /// Remove desktop entries and icons created by tui-shim
@@ -92,7 +99,14 @@ struct Ctx {
 fn sync_one(cx: &Ctx, f: &scan::Found, term: desktop::Term, term_bin: &str, no_theme: bool, force: bool) -> Result<()> {
     println!("{}:", f.app.name);
     let icon = icons::resolve(f.app, &cx.home, &cx.pal, cx.dry, cx.offline)?;
-    let exec = desktop::exec_line(f.app, &f.bin, term, term_bin, &cx.pal);
+    let is_editor = f.app.categories.iter().any(|c| c == "TextEditor");
+    let exec = if cfg!(feature = "gui") && is_editor {
+        // editors go through `open`: file picker + folder overlay
+        let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+        desktop::direct_exec(&[exe, "open".into(), f.app.name.clone(), "%f".into()])
+    } else {
+        desktop::exec_line(f.app, &f.bin, term, term_bin, &cx.pal)
+    };
     let path = desktop::apps_dir(&cx.home).join(desktop::file_name(f.app));
     desktop::write(&path, &desktop::render(f.app, &exec, &icon), cx.dry)?;
     if !no_theme {
@@ -247,6 +261,73 @@ fn run_edit(cx: &Ctx, th: &Theme, apps: &[App], file: &Option<PathBuf>, new: boo
     Ok(())
 }
 
+fn detached(argv: &[String]) -> Result<()> {
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // SAFETY: setsid only; the new process must outlive this one.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().with_context(|| format!("cannot start {}", argv[0]))?;
+    Ok(())
+}
+
+fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf>) -> Result<()> {
+    let app = apps.iter().find(|a| a.name == name).with_context(|| format!("unknown app {name}"))?;
+    let found = scan::scan(apps, &cx.home).into_iter().find(|f| f.app.name == name).with_context(|| format!("{name} is not installed"))?;
+    let start = std::env::current_dir().ok().filter(|d| d.starts_with(&cx.home)).unwrap_or_else(|| cx.home.clone());
+    let file = match file {
+        Some(f) => Some(f),
+        None if app.builtin_picker => None,
+        None => match picker::pick_file(&cx.home, &start, th)? {
+            Some(f) => Some(f),
+            None => return Ok(()),
+        },
+    };
+    if let Some(f) = &file {
+        if let Some(parent) = f.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        files::push_recent(&cx.home, f);
+    }
+    let (term, term_bin) = desktop::detect_terminal().context("no supported terminal found")?;
+    let mut argv = desktop::launch_args(app, &found.bin, term, &term_bin, &cx.pal);
+    let sock = (app.remote.as_deref() == Some("nvim")).then(|| {
+        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+        format!("{dir}/tui-shim-nvim-{}.sock", std::process::id())
+    });
+    if let Some(s) = &sock {
+        argv.extend(["--listen".into(), s.clone()]);
+    }
+    if let Some(f) = &file {
+        argv.push(f.to_string_lossy().into_owned());
+    }
+    let class = format!("tui-shim.{}", app.name);
+    #[cfg(feature = "gui")]
+    let before = track::window_ids(&class);
+    detached(&argv)?;
+
+    #[cfg(feature = "gui")]
+    if th.gui && std::env::var_os("NIRI_SOCKET").is_some() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        track::spawn(class, before, tx);
+        let (home, exe, app_name, bin) = (cx.home.clone(), std::env::current_exe()?, app.name.clone(), found.bin.clone());
+        let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p| {
+            let _ = match &sock {
+                // nvim: open in the running instance
+                Some(s) => detached(&[bin.to_string_lossy().into_owned(), "--server".into(), s.clone(), "--remote-tab".into(), p.to_string_lossy().into_owned()]),
+                // others have no remote protocol: a new window (with its own overlay)
+                None => detached(&[exe.to_string_lossy().into_owned(), "open".into(), app_name.clone(), p.to_string_lossy().into_owned()]),
+            };
+        });
+        gui::overlay(gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick }, rx);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unset")?);
@@ -320,6 +401,11 @@ fn main() -> Result<()> {
             let pal = load_pal().ok();
             let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
             run_edit(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, file, *new)?;
+        }
+        Cmd::Open { app, file } => {
+            let pal = load_pal().ok();
+            let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
+            run_open(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, app, file.clone())?;
         }
         Cmd::NiriRule => {
             println!("// add to ~/.config/niri/config.kdl\nwindow-rule {{\n    match app-id=r#\"^tui-shim\\.picker$\"#\n    open-floating true\n}}");

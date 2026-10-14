@@ -6,5 +6,7 @@ keywords = ["editor", "vim", "text"]
 icon_names = ["nvim", "neovim"]
 dashboard_icon = "neovim"
 simple_icon = "neovim"
+builtin_picker = true
+remote = "nvim"
 [theme]
 fallback = "terminal"
