@@ -960,7 +960,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
             Rc::new(move || {
                 if open.borrow().is_some() {
                     // a second click while the panel is still appearing is the same click, not "close"
-                    if opened_at.get().elapsed() > Duration::from_millis(700) {
+                    if opened_at.get().elapsed() > Duration::from_millis(400) {
                         let c = close_slot.borrow().clone();
                         if let Some(c) = c {
                             c();
@@ -1014,12 +1014,17 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                             files::save_view(&home, &v);
                             *view.borrow_mut() = v;
                         }
+                        // give the keyboard and the pointer back to the editor right away; only the
+                        // picture is still on screen while it slides away
+                        win.set_keyboard_mode(KeyboardMode::None);
+                        win.set_can_target(false);
                         if let Some(r) = rev_slot.borrow().as_ref() {
-                            r.set_reveal_child(false); // fade out
+                            r.set_transition_duration(120);
+                            r.set_reveal_child(false);
                         }
                         open.borrow_mut().take();
                         let win = win.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(200), move || win.close());
+                        glib::timeout_add_local_once(Duration::from_millis(140), move || win.close());
                     })
                 };
                 let (c, h, pf, op) = (close.clone(), home.clone(), picked_file.clone(), on_pick.clone());
@@ -1038,8 +1043,8 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 *snap_slot.borrow_mut() = Some(snapshot);
                 panel.add_css_class("tui-panel");
                 panel.set_width_request(PANEL_W);
-                // a plain fade: sliding from the top edge showed its first frames beside the window
-                let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::Crossfade).transition_duration(160).child(&panel).build();
+                // slides down from the top edge; the window is already at its final spot, so nothing shows beside the editor
+                let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).transition_duration(220).child(&panel).build();
                 *rev_slot.borrow_mut() = Some(rev.clone());
                 win.set_child(Some(&rev));
                 *open.borrow_mut() = Some(win.clone());
@@ -1063,7 +1068,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                             seen.set(true);
                         } else if seen.get() {
                             let (close, w) = (close.clone(), w.clone());
-                            glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                            glib::timeout_add_local_once(Duration::from_millis(120), move || {
                                 if !w.is_active() {
                                     close();
                                 }
