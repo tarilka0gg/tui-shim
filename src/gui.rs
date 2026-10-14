@@ -943,13 +943,19 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         // `at_pointer`: opened by a mouse click on the badge, so the pointer marks where the badge is
         let toggle_slot: Rc<RefCell<Option<Rc<dyn Fn(bool)>>>> = Rc::new(RefCell::new(None));
         let opened_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
+        // how to close the panel that is open right now (animated, and forgets the window)
+        let close_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let toggle: Rc<dyn Fn(bool)> = {
-            let (app, home, start, reveal, geometry, open, on_pick, toggle_slot, opened_at) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone(), toggle_slot.clone(), opened_at.clone());
+            let (app, home, start, reveal, geometry, open, on_pick, toggle_slot, opened_at, close_slot) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone(), toggle_slot.clone(), opened_at.clone(), close_slot.clone());
             Rc::new(move |at_pointer: bool| {
-                if let Some(w) = open.borrow().as_ref() {
+                if open.borrow().is_some() {
                     // a second click while the panel is still appearing is the same click, not "close"
                     if opened_at.get().elapsed() > Duration::from_millis(900) {
-                        w.close();
+                        crate::log("badge click while open -> closing");
+                        let c = close_slot.borrow().clone();
+                        if let Some(c) = c {
+                            c();
+                        }
                     }
                     return;
                 }
@@ -1007,6 +1013,36 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 fixed.put(&rev, 0.0, 0.0);
                 win.set_child(Some(&fixed));
                 *open.borrow_mut() = Some(win.clone());
+                *close_slot.borrow_mut() = Some(close.clone());
+                {
+                    // whichever way the window goes away, forget it (but only if it is still the current one)
+                    let (open, w) = (open.clone(), win.clone());
+                    win.connect_close_request(move |_| {
+                        if open.borrow().as_ref() == Some(&w) {
+                            open.borrow_mut().take();
+                        }
+                        glib::Propagation::Proceed
+                    });
+                }
+                {
+                    // keyboard focus left the panel (the user went to another window): close it
+                    let (close, w) = (close.clone(), win.clone());
+                    let seen = Cell::new(false);
+                    win.connect_is_active_notify(move |win| {
+                        crate::log(&format!("panel is_active={}", win.is_active()));
+                        if win.is_active() {
+                            seen.set(true);
+                        } else if seen.get() {
+                            let (close, w) = (close.clone(), w.clone());
+                            glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                                if !w.is_active() {
+                                    crate::log("panel lost focus -> closing");
+                                    close();
+                                }
+                            });
+                        }
+                    });
+                }
 
                 // pointer position inside the full-screen surface = output coordinates
                 let pointer: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
@@ -1017,7 +1053,10 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 let motion = gtk::EventControllerMotion::new();
                 {
                     let p = pointer.clone();
-                    motion.connect_enter(move |_, x, y| p.set(Some((x, y))));
+                    motion.connect_enter(move |_, x, y| {
+                        crate::log(&format!("pointer enter ({x:.0},{y:.0})"));
+                        p.set(Some((x, y)));
+                    });
                 }
                 {
                     let p = pointer.clone();
@@ -1034,6 +1073,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 {
                     let (rev, fixed, close) = (rev.clone(), fixed.clone(), close.clone());
                     away.connect_pressed(move |_, _, x, y| {
+                        crate::log(&format!("press on the overlay surface at ({x:.0},{y:.0})"));
                         let inside = rev.compute_bounds(&fixed).is_some_and(|b| b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)));
                         if !inside {
                             close();
