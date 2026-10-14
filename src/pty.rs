@@ -310,6 +310,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
     let mut last_winch: Option<Instant> = None;
     let mut dirty_since: Option<Instant> = None;
     let mut last_upload = Instant::now();
+    let mut last_refresh = Instant::now();
     let (mut probe_req, mut probe_until, mut marker_uploaded): (bool, Option<Instant>, Option<(bool, u32)>) = (false, None, None);
     let mut buf = [0u8; 8192];
     'outer: loop {
@@ -403,6 +404,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         // (a short quiet is enough) so the badge follows the new width instead of waiting for the end
         let resizing = last_winch.is_some_and(|t| t.elapsed() < Duration::from_millis(800));
         let quiet = Duration::from_millis(if resizing { 12 } else { 120 });
+        // the picture can vanish without the editor printing anything (the terminal drops it, a
+        // workspace switch, ...): while idle, put it back about once a second
+        if deco.is_some() && !dirty && last_refresh.elapsed() >= Duration::from_secs(1) {
+            dirty = true;
+        }
         if dirty && dirty_since.is_none() {
             dirty_since = Some(Instant::now());
         }
@@ -428,6 +434,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             }
             dirty = false;
             dirty_since = None;
+            last_refresh = Instant::now();
         }
     }
     if deco.is_some() {

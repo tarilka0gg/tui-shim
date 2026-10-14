@@ -379,7 +379,7 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
                 }
             }
         });
-        let expand_on_start = file.is_none() && !app.builtin_picker;
+        let expand_on_start = file.is_none(); // every editor offers the picker when it starts with no file
         let probe = match (badge, &sock_for_probe) {
             (true, Some(sk)) => Some(gui::ProbeCfg { sock: sk.clone(), fill: icon::marker_fill(pal_rgb(th.palette(), "bg_alt", "#DAD4C1")) }),
             _ => None,
@@ -501,7 +501,7 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
                 }
             });
             let home = cx.home.clone();
-            let expand_on_start = file.is_none() && !app.builtin_picker;
+            let expand_on_start = file.is_none(); // every editor offers the picker when it starts with no file
             let probe = badge.then(|| gui::ProbeCfg { sock: sock_probe.clone(), fill: icon::marker_fill(pal_rgb(th.palette(), "bg_alt", "#DAD4C1")) });
             let cfg = gui::OverlayCfg { probe, home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
             if badge {
