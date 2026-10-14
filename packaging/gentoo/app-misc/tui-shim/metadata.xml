@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>216761460+tarilka0gg@users.noreply.github.com</email>
+		<name>tarilka0gg</name>
+	</maintainer>
+	<longdescription>
+		Makes terminal programs (btop, micro, nvim, yazi, ...) behave like desktop apps on niri: launcher entries with icons, and a
+		folder badge inside the editor window that opens a native file picker.
+	</longdescription>
+	<use>
+		<flag name="gui">Build the GTK4/libadwaita file picker</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">tarilka0gg/tui-shim</remote-id>
+	</upstream>
+</pkgmetadata>
