@@ -941,8 +941,9 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         let open: Rc<RefCell<Option<gtk::ApplicationWindow>>> = Rc::new(RefCell::new(None));
 
         // `at_pointer`: opened by a mouse click on the badge, so the pointer marks where the badge is
+        let toggle_slot: Rc<RefCell<Option<Rc<dyn Fn(bool)>>>> = Rc::new(RefCell::new(None));
         let toggle: Rc<dyn Fn(bool)> = {
-            let (app, home, start, reveal, geometry, open, on_pick) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone());
+            let (app, home, start, reveal, geometry, open, on_pick, toggle_slot) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone(), toggle_slot.clone());
             Rc::new(move |at_pointer: bool| {
                 if let Some(w) = open.borrow().as_ref() {
                     w.close();
@@ -956,7 +957,9 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 for e in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
                     win.set_anchor(e, true);
                 }
-                win.set_exclusive_zone(-1);
+                // pointer mode: output coordinates (matches the pointer); otherwise the usable area,
+                // which is what the layout estimate is measured in
+                win.set_exclusive_zone(if at_pointer { -1 } else { 0 });
                 win.set_keyboard_mode(KeyboardMode::OnDemand);
                 win.set_namespace(Some("tui-shim-panel"));
                 let (right, top, _edge_x, exact, monitor) = geometry.borrow().clone();
@@ -1031,27 +1034,49 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 }
                 fixed.add_controller(away);
 
+                let remembered = reveal.borrow().clone(); // file to select again if we have to reopen
                 refresh();
                 win.present();
-                // place the panel once the surface has its size and the pointer has been seen
-                let (win2, fixed2, rev2) = (win.clone(), fixed.clone(), rev.clone());
-                glib::timeout_add_local_once(Duration::from_millis(if at_pointer { 160 } else { 60 }), move || {
-                    let _ = &win2;
+                // place the panel once the pointer has been seen (mouse click) or the surface is up
+                const INSET: f64 = 50.0; // distance from the window's top and right borders
+                const MARGIN: f64 = 10.0; // the panel's own margin: its visible edge is this far inside the box
+                let (win2, fixed2, rev2, slot2, open2, reveal2) = (win.clone(), fixed.clone(), rev.clone(), toggle_slot.clone(), open.clone(), reveal.clone());
+                let began = Instant::now();
+                glib::timeout_add_local(Duration::from_millis(60), move || {
                     let (sw, sh) = screen;
-                    let (x, y) = match (at_pointer, pointer.get(), exact) {
-                        // under the badge, right edges aligned
-                        (true, Some((px, py)), _) => (px - PANEL_W + 36.0, py + 26.0),
-                        (_, _, true) => (sw - (right - 10).max(0) as f64 - PANEL_W, (top - 10).max(0) as f64 + 30.0),
-                        _ => ((sw - PANEL_W) / 2.0, 80.0),
+                    let place = |x: f64, y: f64| {
+                        fixed2.move_(&rev2, x.clamp(8.0, (sw - PANEL_W - 8.0).max(8.0)), y.clamp(8.0, (sh - 440.0).max(8.0)));
+                        rev2.set_visible(true);
+                        rev2.set_reveal_child(true);
+                        focus();
                     };
-                    fixed2.move_(&rev2, x.clamp(8.0, (sw - PANEL_W - 8.0).max(8.0)), y.clamp(8.0, (sh - 440.0).max(8.0)));
-                    rev2.set_visible(true);
-                    rev2.set_reveal_child(true);
-                    focus();
+                    if at_pointer {
+                        match pointer.get() {
+                            // pointer sits on the badge, which is about 29px in from the window's right
+                            // edge and 24px down from its top edge
+                            Some((px, py)) => place(px + 29.0 - INSET - MARGIN - PANEL_W, py - 24.0 + INSET - MARGIN),
+                            None if began.elapsed() < Duration::from_millis(800) => return glib::ControlFlow::Continue,
+                            None => {
+                                // the compositor never reported the pointer: use the layout estimate instead
+                                open2.borrow_mut().take();
+                                win2.close();
+                                *reveal2.borrow_mut() = remembered.clone();
+                                if let Some(t) = slot2.borrow().clone() {
+                                    t(false);
+                                }
+                            }
+                        }
+                    } else if exact {
+                        place(sw - (right - 10).max(0) as f64 - INSET - MARGIN - PANEL_W, (top - 10).max(0) as f64 + INSET - MARGIN);
+                    } else {
+                        place((sw - PANEL_W) / 2.0, 80.0);
+                    }
+                    glib::ControlFlow::Break
                 });
             })
         };
 
+        *toggle_slot.borrow_mut() = Some(toggle.clone());
         let (app2, started) = (app.clone(), Cell::new(!expand_on_start));
         glib::timeout_add_local(Duration::from_millis(80), move || {
             while let Ok(m) = rx.try_recv() {
