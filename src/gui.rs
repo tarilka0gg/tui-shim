@@ -1134,7 +1134,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     let since = at.saturating_duration_since(opened_at.get());
                     crate::log(&format!("badge event while open (arrived {since:?} after the click that opened it)"));
                     // a second click right after the first is the same double click, not "close"
-                    if since > Duration::from_millis(500) {
+                    if since > Duration::from_millis(250) {
                         let c = close_slot.borrow().clone();
                         if let Some(c) = c {
                             c();
