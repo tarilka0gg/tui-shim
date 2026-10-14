@@ -228,6 +228,23 @@ fn mouse_state(chunk: &[u8], current: bool) -> bool {
     mode_state(chunk, &["1000", "1002", "1003"], current)
 }
 
+/// Does the editor's output contain a kitty-graphics delete command (`ESC _ G ... a=d ... ESC \\`)?
+/// Editors with image support (snacks.nvim in LazyVim, for one) clear all images, which also frees
+/// the picture we uploaded: placing it afterwards shows nothing until it is sent again.
+fn deletes_images(chunk: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(i) = chunk[from..].windows(3).position(|w| w == b"\x1b_G") {
+        let start = from + i + 3;
+        let end = chunk[start..].iter().position(|&b| b == 0x1b).map(|e| start + e).unwrap_or(chunk.len().min(start + 96));
+        let keys = &chunk[start..end];
+        if keys.split(|&b| b == b',' || b == b';').next().is_some_and(|k| k == b"a=d") || keys.windows(4).any(|w| w == b",a=d" || w == b"a=d,") {
+            return true;
+        }
+        from = start;
+    }
+    false
+}
+
 /// Does the editor's output switch to (or from) the alternate screen? Kitty-protocol terminals
 /// keep image storage per screen, so the badge has to be uploaded again after a switch.
 fn alt_screen_state(chunk: &[u8], current: bool) -> bool {
@@ -290,6 +307,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
     let (mut alt, mut uploaded): (bool, Option<(bool, u32)>) = (false, None);
     let mut last_winch: Option<Instant> = None;
     let mut dirty_since: Option<Instant> = None;
+    let mut last_upload = Instant::now();
     let (mut probe_req, mut probe_until, mut marker_uploaded): (bool, Option<Instant>, Option<(bool, u32)>) = (false, None, None);
     let mut buf = [0u8; 8192];
     'outer: loop {
@@ -352,6 +370,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             write_all(1, &buf[..n as usize]);
             editor_mouse = mouse_state(&buf[..n as usize], editor_mouse);
             alt = alt_screen_state(&buf[..n as usize], alt);
+            if deletes_images(&buf[..n as usize]) {
+                uploaded = None; // our pictures are gone with the rest: send them again at the next draw
+                marker_uploaded = None;
+                crate::log("the editor deleted all images: re-uploading the badge");
+            }
             dirty = deco.is_some();
             last_out = Instant::now();
         }
@@ -389,7 +412,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                     if uploaded.is_none() {
                         crate::log(&format!("terminal size: cols/rows/xpix/ypix = {:?}, badge = {b:?}", winsize(0)));
                     }
-                    if uploaded != Some((alt, b.img_h)) {
+                    // also re-send now and then: if the terminal ever drops the picture for a reason we
+                    // cannot see, the badge comes back by itself
+                    let stale = last_upload.elapsed() > Duration::from_secs(3);
+                    if uploaded != Some((alt, b.img_h)) || stale {
+                        last_upload = Instant::now();
                         // image storage is per screen, and the picture's shape follows the cell shape: (re)send
                         upload_icon(IMG_ID, &crate::icon::folder_icon(b.img_w as usize, b.img_h as usize, b.img_top as usize, d.bg, d.fg, d.ring), b.img_w, b.img_h);
                         uploaded = Some((alt, b.img_h));
@@ -497,6 +524,15 @@ mod tests {
         assert!(alt_screen_state(b"\x1b[?1049h", false));
         assert!(!alt_screen_state(b"\x1b[?1049h...\x1b[?1049l", false));
         assert!(alt_screen_state(b"plain output", true));
+    }
+
+    #[test]
+    fn image_delete_commands_are_recognised() {
+        assert!(deletes_images(b"text\x1b_Ga=d,d=A\x1b\\more"));
+        assert!(deletes_images(b"\x1b_Gq=2,a=d,d=I,i=5\x1b\\"));
+        assert!(!deletes_images(b"\x1b_Ga=T,f=32,s=1,v=1;AAAA\x1b\\"), "transmitting is not deleting");
+        assert!(!deletes_images(b"\x1b_Ga=q,i=31;AAAA\x1b\\"), "a support query is not deleting");
+        assert!(!deletes_images(b"plain output with a=d in it"));
     }
 
     #[test]
