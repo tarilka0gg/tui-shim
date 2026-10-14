@@ -1,0 +1,8 @@
+name = "lazygit"
+title = "lazygit"
+comment = "Terminal UI for git"
+categories = ["Development", "RevisionControl", "ConsoleOnly"]
+keywords = ["git", "vcs"]
+icon_names = ["lazygit", "git"]
+[theme]
+fallback = "terminal"

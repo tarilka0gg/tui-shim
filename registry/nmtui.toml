@@ -1,0 +1,10 @@
+name = "nmtui"
+title = "Network Manager TUI"
+comment = "Manage network connections"
+categories = ["Settings", "ConsoleOnly"]
+keywords = ["network", "wifi", "ethernet"]
+icon_names = ["network-wired", "preferences-system-network"]
+[theme]
+# newt reads NEWT_COLORS from the environment
+env = { NEWT_COLORS = "root=black,lightgray;window=black,lightgray;border=black,lightgray;title=black,lightgray;button=black,yellow;actbutton=white,red;entry=black,white;textbox=black,lightgray;label=black,lightgray" }
+fallback = "terminal"

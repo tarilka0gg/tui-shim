@@ -1,0 +1,15 @@
+name = "btop"
+title = "btop"
+comment = "Resource monitor"
+categories = ["System", "Monitor", "ConsoleOnly"]
+keywords = ["system", "monitor", "cpu", "process"]
+icon_names = ["btop", "utilities-system-monitor"]
+
+[theme]
+path = "~/.config/btop/themes/tui-shim.theme"
+template = "btop.theme"
+[theme.activate]
+file = "~/.config/btop/btop.conf"
+key = "color_theme"
+value = "tui-shim"
+style = "quoted"

@@ -1,0 +1,15 @@
+name = "micro"
+title = "micro"
+comment = "Terminal text editor"
+categories = ["Utility", "TextEditor", "ConsoleOnly"]
+keywords = ["editor", "text"]
+icon_names = ["micro", "text-editor"]
+dashboard_icon = "micro"
+[theme]
+path = "~/.config/micro/colorschemes/tui-shim.micro"
+template = "micro.colorscheme"
+[theme.activate]
+file = "~/.config/micro/settings.json"
+key = "colorscheme"
+value = "tui-shim"
+style = "json"

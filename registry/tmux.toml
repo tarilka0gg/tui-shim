@@ -1,0 +1,9 @@
+name = "tmux"
+title = "tmux"
+comment = "Terminal multiplexer"
+categories = ["System", "TerminalEmulator", "ConsoleOnly"]
+keywords = ["terminal", "multiplexer", "session"]
+icon_names = ["tmux", "utilities-terminal"]
+simple_icon = "tmux"
+[theme]
+fallback = "terminal"

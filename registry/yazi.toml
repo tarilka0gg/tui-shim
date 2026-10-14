@@ -1,0 +1,15 @@
+name = "yazi"
+title = "Yazi"
+comment = "Terminal file manager"
+categories = ["System", "FileManager", "ConsoleOnly"]
+keywords = ["files", "manager"]
+icon_names = ["yazi", "system-file-manager"]
+
+[theme]
+path = "~/.config/yazi/flavors/tui-shim.yazi/flavor.toml"
+template = "yazi.flavor.toml"
+[theme.activate]
+file = "~/.config/yazi/theme.toml"
+key = "flavor.dark"
+value = "tui-shim"
+style = "yazi-flavor"

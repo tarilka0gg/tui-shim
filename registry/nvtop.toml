@@ -1,0 +1,8 @@
+name = "nvtop"
+title = "nvtop"
+comment = "GPU process monitor"
+categories = ["System", "Monitor", "ConsoleOnly"]
+keywords = ["gpu", "nvidia", "monitor"]
+icon_names = ["nvtop", "utilities-system-monitor"]
+[theme]
+fallback = "terminal"

@@ -1,0 +1,19 @@
+# tui-shim managed. Palette: {{palette_name}}
+[mgr]
+cwd = { fg = "{{accent}}" }
+hovered = { fg = "{{fg}}", bg = "{{khaki}}" }
+find_keyword = { fg = "{{accent}}", bold = true }
+tab_active = { fg = "{{fg}}", bg = "{{khaki}}" }
+tab_inactive = { fg = "{{fg_dim}}", bg = "{{bg_alt}}" }
+border_style = { fg = "{{secondary}}" }
+
+[status]
+overall = { fg = "{{fg}}", bg = "{{bg_alt}}" }
+sep_left = { open = "", close = "" }
+sep_right = { open = "", close = "" }
+
+[filetype]
+rules = [
+  { name = "*/", fg = "{{accent}}" },
+  { name = "*", fg = "{{fg}}" },
+]

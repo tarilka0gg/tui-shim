@@ -1,0 +1,11 @@
+name = "htop"
+title = "htop"
+comment = "Interactive process viewer"
+categories = ["System", "Monitor", "ConsoleOnly"]
+keywords = ["system", "monitor", "process"]
+icon_names = ["htop", "utilities-system-monitor"]
+
+simple_icon = "htop"
+[theme]
+# htop has no external theme file: recolor via terminal-level ANSI override
+fallback = "terminal"

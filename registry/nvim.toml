@@ -1,0 +1,10 @@
+name = "nvim"
+title = "Neovim"
+comment = "Vim-based text editor"
+categories = ["Utility", "TextEditor", "ConsoleOnly"]
+keywords = ["editor", "vim", "text"]
+icon_names = ["nvim", "neovim"]
+dashboard_icon = "neovim"
+simple_icon = "neovim"
+[theme]
+fallback = "terminal"

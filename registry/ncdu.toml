@@ -1,0 +1,8 @@
+name = "ncdu"
+title = "ncdu"
+comment = "Disk usage analyzer"
+categories = ["System", "Filesystem", "ConsoleOnly"]
+keywords = ["disk", "usage"]
+icon_names = ["ncdu", "drive-harddisk"]
+[theme]
+fallback = "terminal"
