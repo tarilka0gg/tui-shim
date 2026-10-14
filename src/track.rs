@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     /// margins are from the monitor's top-right corner, in logical pixels
-    Show { right: i32, top: i32, /** x of the window's right edge; 0 when unknown */ edge_x: i32, monitor: Option<String> },
+    Show { right: i32, top: i32, /** x of the window's right edge; 0 when unknown */ edge_x: i32, /** position worked out, not a corner fallback */ exact: bool, monitor: Option<String> },
+    /// the in-terminal badge was clicked
+    Click,
     Hide,
     Quit,
 }
@@ -108,7 +110,7 @@ fn state_for(id: u64) -> Msg {
     let monitor = ws.iter().find(|x| x["id"] == w["workspace_id"]).and_then(|x| x["output"].as_str().map(String::from));
     let out_w = monitor.as_deref().and_then(|m| niri_json(&["outputs"]).map(|o| o[m]["logical"]["width"].as_i64())).flatten();
     // default: monitor's top-right corner (used when the position cannot be worked out)
-    let (mut right, mut top, mut edge_x) = (INSET, INSET, 0);
+    let (mut right, mut top, mut edge_x, mut exact) = (INSET, INSET, 0, false);
     if let Some(ow) = out_w {
         let size = &w["layout"]["tile_size"];
         let tile_w = size[0].as_f64().unwrap_or(0.0).round() as i64;
@@ -122,9 +124,10 @@ fn state_for(id: u64) -> Msg {
             right = (ow - (x + tile_w)).max(0) + INSET;
             top = y + INSET;
             edge_x = x + tile_w;
+            exact = true;
         }
     }
-    Msg::Show { right: right as i32, top: top as i32, edge_x: edge_x as i32, monitor }
+    Msg::Show { right: right as i32, top: top as i32, edge_x: edge_x as i32, exact, monitor }
 }
 
 /// Pid of `pid`'s parent, from /proc.

@@ -1,5 +1,6 @@
 mod choices;
 mod desktop;
+mod icon;
 mod files;
 #[cfg(feature = "gui")]
 mod gui;
@@ -87,9 +88,18 @@ enum Cmd {
         #[arg(value_enum, default_value = "status")]
         action: ShimAction,
     },
+    /// (debug) measure the area niri leaves for windows on each monitor
+    #[command(hide = true)]
+    Usable,
     /// (internal) run a command on a pty that `open` can type into
     #[command(hide = true)]
     PtyRun {
+        /// control socket that receives "click" when the in-terminal badge is clicked
+        #[arg(long)]
+        ctl: Option<PathBuf>,
+        /// "bg,fg,ring" colours of the in-terminal badge
+        #[arg(long)]
+        badge: Option<String>,
         sock: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         argv: Vec<String>,
@@ -322,10 +332,16 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
     let exe = std::env::current_exe()?;
     // editors we know how to type into run under our pty wrapper so the overlay can open files in place
     let sock = (overlay && app.open_keys.is_some()).then(|| pty::socket_path(std::process::id()));
+    let badge = sock.is_some() && matches!(term, desktop::Term::Ghostty | desktop::Term::Kitty);
+    let ctl = sock.as_ref().map(|s| s.with_extension("ctl"));
     let mut argv = if sock.is_some() {
         // launch_args ends with the program to run: make that the wrapper
         let mut a = desktop::launch_args(app, &exe, term, &term_bin, &cx.pal);
-        a.extend(["pty-run".into(), sock.as_ref().unwrap().to_string_lossy().into_owned(), "--".into(), found.bin.to_string_lossy().into_owned()]);
+        a.push("pty-run".into());
+        if let (true, Some(c)) = (badge, &ctl) {
+            a.extend(["--ctl".into(), c.to_string_lossy().into_owned(), "--badge".into(), badge_colors(th.palette())]);
+        }
+        a.extend([sock.as_ref().unwrap().to_string_lossy().into_owned(), "--".into(), found.bin.to_string_lossy().into_owned()]);
         a
     } else {
         desktop::launch_args(app, &found.bin, term, &term_bin, &cx.pal)
@@ -336,12 +352,15 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
     let class = format!("tui-shim.{}", app.name);
     #[cfg(feature = "gui")]
     let before = track::window_ids(&class);
-    detached(&argv)?;
+    detached(&desktop::finish_args(term, argv))?;
 
     #[cfg(feature = "gui")]
     if overlay {
         let (tx, rx) = std::sync::mpsc::channel();
-        track::spawn(class, before, tx);
+        track::spawn(class, before, tx.clone());
+        if let (true, Some(c)) = (badge, ctl) {
+            listen_ctl(c, tx);
+        }
         let (home, name, app2) = (cx.home.clone(), app.name.clone(), app.clone());
         let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p: PathBuf| {
             if let Some(parent) = p.parent() {
@@ -359,9 +378,62 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
             }
         });
         let expand_on_start = file.is_none() && !app.builtin_picker;
-        gui::overlay(gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start }, rx);
+        let cfg = gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
+        if badge {
+            gui::panel_overlay(cfg, rx);
+        } else {
+            gui::overlay(cfg, rx);
+        }
     }
     Ok(())
+}
+
+fn pal_rgb(pal: Option<&Palette>, key: &str, default: &str) -> [u8; 3] {
+    icon::parse_hex(pal.and_then(|p| p.get(key)).unwrap_or(default)).unwrap_or([128, 128, 128])
+}
+
+/// Colours of the in-terminal badge as "bg,fg,ring" hex.
+fn badge_colors(pal: Option<&Palette>) -> String {
+    let g = |k: &str, d: &str| pal.and_then(|p| p.get(k)).unwrap_or(d).to_string();
+    format!("{},{},{}", g("bg_alt", "#DAD4C1"), g("fg", "#3B342B"), g("secondary", "#7D8278")).replace('#', "")
+}
+
+/// Can the terminal we are running in draw images (kitty graphics protocol)?
+fn terminal_draws_images() -> bool {
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    matches!(var("TERM_PROGRAM").as_str(), "ghostty" | "kitty") || var("TERM").contains("ghostty") || var("TERM").contains("kitty")
+}
+
+/// Forward "click" datagrams from the in-terminal badge to the overlay as messages.
+#[cfg(feature = "gui")]
+fn listen_ctl(path: PathBuf, tx: std::sync::mpsc::Sender<track::Msg>) {
+    let _ = std::fs::remove_file(&path);
+    let Ok(sock) = std::os::unix::net::UnixDatagram::bind(&path) else { return };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        while sock.recv(&mut buf).is_ok() {
+            if tx.send(track::Msg::Click).is_err() {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+/// The overlay shares this terminal in terminal mode; stray GTK/Mesa warnings on stderr would be
+/// drawn over the editor. Send them to a log (TUI_SHIM_LOG) or nowhere.
+fn silence_stderr() {
+    let path = std::env::var("TUI_SHIM_LOG").unwrap_or_else(|_| "/dev/null".into());
+    if let Ok(c) = std::ffi::CString::new(path) {
+        // SAFETY: open/dup2/close on a freshly opened fd; fd 2 is replaced, nothing else is touched.
+        unsafe {
+            let fd = libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
+            if fd >= 0 {
+                libc::dup2(fd, 2);
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 /// Run the editor in the current terminal. With the overlay available it runs on our pty
@@ -375,13 +447,24 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
     if overlay && app.open_keys.is_some() {
         if let Some(id) = track::own_window_id() {
             let sock = pty::socket_path(std::process::id());
+            let ctl = sock.with_extension("ctl");
+            // terminals that draw images get the button inside the window, always at its corner
+            let badge = terminal_draws_images();
+            let deco = badge.then(|| {
+                let pal = th.palette();
+                pty::Deco { rgba: icon::folder_icon(64, pal_rgb(pal, "bg_alt", "#DAD4C1"), pal_rgb(pal, "fg", "#3B342B"), pal_rgb(pal, "secondary", "#7D8278")), px: 64, ctl: ctl.clone() }
+            });
             let (sock2, argv2) = (sock.clone(), argv.clone());
+            silence_stderr();
             let editor = std::thread::spawn(move || {
-                let code = pty::run(&sock2, &argv2).unwrap_or(1);
+                let code = pty::run(&sock2, &argv2, deco).unwrap_or(1);
                 std::process::exit(code); // editor exited: take the overlay down with it
             });
             let (tx, rx) = std::sync::mpsc::channel();
-            track::follow_window(id, tx);
+            track::follow_window(id, tx.clone());
+            if badge {
+                listen_ctl(ctl, tx);
+            }
             let app2 = app.clone();
             let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p: PathBuf| {
                 if let Some(parent) = p.parent() {
@@ -393,7 +476,12 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
             });
             let home = cx.home.clone();
             let expand_on_start = file.is_none() && !app.builtin_picker;
-            gui::overlay(gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start }, rx);
+            let cfg = gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
+            if badge {
+                gui::panel_overlay(cfg, rx);
+            } else {
+                gui::overlay(cfg, rx);
+            }
             let _ = editor.join();
             return Ok(());
         }
@@ -556,9 +644,19 @@ fn main() -> Result<()> {
             let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
             run_open(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, app, file.clone())?;
         }
+        Cmd::Usable => {
+            #[cfg(feature = "gui")]
+            for (name, w, h) in gui::usable_areas() {
+                println!("{name}: usable {w}x{h}");
+            }
+        }
         Cmd::Shims { action } => run_shims(&home, &apps, *action)?,
-        Cmd::PtyRun { sock, argv } => {
-            std::process::exit(pty::run(sock, argv)?);
+        Cmd::PtyRun { ctl, badge, sock, argv } => {
+            let deco = ctl.clone().zip(badge.as_deref()).and_then(|(ctl, b)| {
+                let c: Vec<[u8; 3]> = b.split(',').filter_map(icon::parse_hex).collect();
+                (c.len() == 3).then(|| pty::Deco { rgba: icon::folder_icon(64, c[0], c[1], c[2]), px: 64, ctl })
+            });
+            std::process::exit(pty::run(sock, argv, deco)?);
         }
         Cmd::NiriRule => {
             println!("// add to ~/.config/niri/config.kdl\nwindow-rule {{\n    match app-id=r#\"^tui-shim\\.picker$\"#\n    open-floating true\n}}");

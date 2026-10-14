@@ -59,7 +59,29 @@ pub fn quote(a: &str) -> String {
 }
 
 pub fn exec_line(app: &App, bin: &Path, term: Term, term_bin: &str, pal: &Palette) -> String {
-    launch_args(app, bin, term, term_bin, pal).iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+    finish_args(term, launch_args(app, bin, term, term_bin, pal)).iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Shell-quote one word (single quotes) unless it is plainly safe.
+pub fn sh_quote(a: &str) -> String {
+    if !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
+        a.to_string()
+    } else {
+        format!("'{}'", a.replace('\'', "'\\''"))
+    }
+}
+
+/// ghostty joins everything after `-e` into one `sh -c` string without quoting, so spaces, `;`
+/// or `#` in an argument would be reinterpreted by the shell. Quote those arguments here.
+pub fn finish_args(term: Term, mut args: Vec<String>) -> Vec<String> {
+    if term == Term::Ghostty {
+        if let Some(i) = args.iter().position(|a| a == "-e") {
+            for a in &mut args[i + 1..] {
+                *a = sh_quote(a);
+            }
+        }
+    }
+    args
 }
 
 /// argv that opens `bin` in a terminal window of class tui-shim.<app>, with recolor/env fallbacks.
@@ -168,5 +190,8 @@ mod tests {
         assert_eq!(quote("A=b;c"), "\"A=b;c\"");
         assert_eq!(quote("100%"), "100%%");
         assert_eq!(quote("%f"), "%f");
+        assert_eq!(sh_quote("plain/path-1.txt"), "plain/path-1.txt");
+        assert_eq!(sh_quote("a b;c#d"), "'a b;c#d'");
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
     }
 }
