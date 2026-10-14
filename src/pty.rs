@@ -2,6 +2,7 @@
 //! (the overlay uses this to open a file in the editor that is already running).
 use anyhow::{bail, Result};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -157,6 +158,42 @@ pub struct Filtered {
     pub clicked: bool,
     /// F9 was pressed
     pub hotkey: bool,
+    /// a mouse button was pressed somewhere in the editor (not on the badge): the click went to the
+    /// terminal, so it did not go to the picker
+    pub outside_press: bool,
+    /// a key was typed into the editor (terminal replies to queries do not count)
+    pub typed: bool,
+}
+
+/// Length of the escape sequence starting at `buf[0] == ESC`, and whether it is something a person
+/// typed (Alt+key) as opposed to a terminal reply (CSI/OSC/DCS/APC...). A lone ESC is the Escape key.
+fn escape_len(buf: &[u8]) -> (usize, bool) {
+    if buf.len() < 2 {
+        return (1, true);
+    }
+    match buf[1] {
+        b'[' => {
+            // CSI: parameters/intermediates, then a final byte 0x40..=0x7e
+            let end = buf[2..].iter().position(|&b| (0x40..=0x7e).contains(&b)).map(|i| i + 3).unwrap_or(buf.len());
+            (end, false)
+        }
+        b']' | b'P' | b'_' | b'^' | b'X' => {
+            // string types end with BEL or ESC \
+            let mut i = 2;
+            while i < buf.len() {
+                if buf[i] == 0x07 {
+                    return (i + 1, false);
+                }
+                if buf[i] == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+                    return (i + 2, false);
+                }
+                i += 1;
+            }
+            (buf.len(), false)
+        }
+        b'O' => (buf.len().min(3), false), // SS3: function keys
+        _ => (2, true),                    // ESC + a character: Alt+key
+    }
 }
 
 impl InputFilter {
@@ -166,7 +203,9 @@ impl InputFilter {
         let mut buf = std::mem::take(&mut self.carry);
         buf.extend_from_slice(data);
         let (mut forward, mut clicked, mut hotkey) = (Vec::with_capacity(buf.len()), false, false);
+        let (mut outside_press, mut typed) = (false, false);
         let mut i = 0;
+        let mut esc_left = 0usize; // bytes of the current non-typed escape sequence still to pass
         while i < buf.len() {
             // F9 opens the picker too, for editors that do not use the mouse
             if buf[i..].starts_with(b"\x1b[20~") {
@@ -175,6 +214,16 @@ impl InputFilter {
                 continue;
             }
             if buf[i] != 0x1b || !buf[i + 1..].starts_with(b"[<") {
+                if buf[i] == 0x1b && esc_left == 0 {
+                    let (len, by_hand) = escape_len(&buf[i..]);
+                    esc_left = if by_hand { 0 } else { len };
+                    typed |= by_hand;
+                }
+                if esc_left > 0 {
+                    esc_left -= 1; // part of a terminal reply, not a keystroke
+                } else if buf[i] != 0x1b {
+                    typed = true;
+                }
                 forward.push(buf[i]);
                 i += 1;
                 continue;
@@ -198,12 +247,18 @@ impl InputFilter {
             let on_badge = matches!(params[..], [b, x, y] if b & 0b1100011 == 0 && (hit.0..=hit.1).contains(&x) && (hit.2..=hit.3).contains(&y));
             if on_badge {
                 clicked |= buf[j] == b'M';
-            } else if editor_mouse {
-                forward.extend_from_slice(&buf[start..=j]);
+            } else {
+                // a button press (not motion, not the wheel) anywhere else went to the editor
+                if buf[j] == b'M' && matches!(params[..], [b, _, _] if b & 0b1100011 < 3) {
+                    outside_press = true;
+                }
+                if editor_mouse {
+                    forward.extend_from_slice(&buf[start..=j]);
+                }
             }
             i = j + 1;
         }
-        Filtered { forward, clicked, hotkey }
+        Filtered { forward, clicked, hotkey, outside_press, typed }
     }
 }
 
@@ -312,6 +367,8 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
     let mut last_upload = Instant::now();
     let mut last_refresh = Instant::now();
     let (mut probe_req, mut probe_until, mut marker_uploaded): (bool, Option<Instant>, Option<(bool, u32)>) = (false, None, None);
+    let mut probe_reply: Option<PathBuf> = None;
+    let mut last_away = Instant::now() - Duration::from_secs(1);
     let mut buf = [0u8; 8192];
     'outer: loop {
         if WINCH.swap(false, Ordering::Relaxed) {
@@ -347,6 +404,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                 let hit = current_badge(0).map(|b| b.hit()).unwrap_or((0, 0, 0, 0));
                 let f = filter.feed(&buf[..n as usize], hit, editor_mouse);
                 write_all(m, &f.forward);
+                // a click or keystroke that reached the editor means the user is in the editor, not in the picker
+                if (f.outside_press || f.typed) && last_away.elapsed() > Duration::from_millis(150) {
+                    last_away = Instant::now();
+                    let _ = ctl.send_to(b"away", &deco.as_ref().unwrap().ctl);
+                }
                 if f.clicked || f.hotkey {
                     crate::log(&format!("wrapper: badge {} hit={hit:?} badge={:?}", if f.clicked { "click" } else { "F9" }, current_badge(0)));
                     let _ = ctl.send_to(if f.clicked { b"click" } else { b"key" }, &deco.as_ref().unwrap().ctl);
@@ -357,8 +419,12 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         }
         if fds[2].revents & libc::POLLIN != 0 {
             while let Ok(n) = dg.recv(&mut buf) {
-                if &buf[..n] == crate::probe::PROBE {
+                if buf[..n].starts_with(crate::probe::PROBE) {
                     probe_req = true; // not for the editor: flash the marker badge
+                    let path = &buf[crate::probe::PROBE.len()..n];
+                    if !path.is_empty() {
+                        probe_reply = Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+                    }
                 } else {
                     write_all(m, &buf[..n]);
                 }
@@ -392,6 +458,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                     marker_uploaded = Some((alt, b.img_h));
                 }
                 place(MARKER_ID, 2, 2000, &b);
+                // tell the overlay the marker is on its way to the screen
+                if let Some(path) = probe_reply.take() {
+                    let r = UnixDatagram::unbound().and_then(|u| u.send_to(b"ok", &path));
+                    crate::log(&format!("probe: answered {} -> {r:?}", path.display()));
+                }
                 let keep = std::env::var("TUI_SHIM_MARKER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500); // invisible, so no cost to keeping it up
                 probe_until = Some(Instant::now() + Duration::from_millis(keep));
             }
@@ -511,6 +582,22 @@ mod tests {
         assert!(r.forward.is_empty());
         let r = f.feed(b"1M", HIT, true);
         assert!(r.clicked);
+    }
+
+    #[test]
+    fn typing_and_clicks_in_the_editor_are_noticed_but_terminal_replies_are_not() {
+        let mut f = InputFilter::default();
+        assert!(f.feed(b"a", HIT, true).typed, "a key");
+        assert!(f.feed(b"\x1b", HIT, true).typed, "the Escape key on its own");
+        assert!(f.feed(b"\x1bx", HIT, true).typed, "Alt+x");
+        // replies a program asks the terminal for (device attributes, colours, cursor position, kitty queries)
+        for reply in [&b"\x1b[?62;4c"[..], b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\", b"\x1b[12;40R", b"\x1b_Gi=31;OK\x1b\\", b"\x1b[I", b"\x1bP>|ghostty 1.1.3\x1b\\"] {
+            assert!(!f.feed(reply, HIT, true).typed, "{reply:?} is not typing");
+        }
+        assert!(f.feed(b"\x1b[<0;10;5M", HIT, true).outside_press, "a click in the editor");
+        assert!(!f.feed(b"\x1b[<0;10;5m", HIT, true).outside_press, "a release is not a press");
+        assert!(!f.feed(b"\x1b[<64;10;5M", HIT, true).outside_press, "the wheel is not a click");
+        assert!(!f.feed(b"\x1b[<0;80;1M", HIT, true).outside_press, "the badge is not 'elsewhere'");
     }
 
     #[test]

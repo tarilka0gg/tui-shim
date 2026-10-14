@@ -12,7 +12,8 @@ pub fn timeout() -> Duration {
     Duration::from_millis(std::env::var("TUI_SHIM_PROBE_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500))
 }
 
-/// Sent to the wrapper's input socket: "draw the marker badge now".
+/// Sent to the wrapper's input socket: "draw the marker badge now". Anything after the prefix is the
+/// path of a socket to answer on once the marker has been drawn.
 pub const PROBE: &[u8] = b"\0tui-shim-probe\0";
 
 /// Where the badge is, in logical pixels from the top-left of its output.
@@ -115,18 +116,32 @@ pub fn locate(sock: &Path, fill: [u8; 3], output: &str) -> Option<Found> {
     let scale = output_scale(output);
     crate::log(&format!("probe: output={output} scale={scale:?} fill={fill:?}"));
     let scale = scale?;
-    let sent = UnixDatagram::unbound().ok()?.send_to(PROBE, sock);
+    // the wrapper answers on this socket as soon as the marker is drawn, so we need not guess how
+    // long a busy editor takes to settle
+    let reply = std::env::temp_dir().join(format!("tui-shim-probe-{}-{}.reply", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)));
+    let reply_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).map(|d| d.join(reply.file_name().unwrap())).unwrap_or(reply);
+    let _ = std::fs::remove_file(&reply_dir);
+    let listener = UnixDatagram::bind(&reply_dir).ok();
+    if let Some(l) = &listener {
+        let _ = l.set_read_timeout(Some(Duration::from_millis(900)));
+    }
+    let mut request = PROBE.to_vec();
+    request.extend_from_slice(reply_dir.as_os_str().as_encoded_bytes());
+    let sent = UnixDatagram::unbound().ok()?.send_to(&request, sock);
     crate::log(&format!("probe: sent to {} -> {sent:?}", sock.display()));
     sent.ok()?;
-    // let the terminal draw it (TUI_SHIM_PROBE_DELAY_MS raises this for slow test sessions)
-    let delay = std::env::var("TUI_SHIM_PROBE_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(140);
+    let acked = listener.as_ref().is_some_and(|l| l.recv(&mut [0u8; 8]).is_ok());
+    let _ = std::fs::remove_file(&reply_dir);
+    // a moment for the terminal to put the marker on screen after the wrapper wrote it
+    // (TUI_SHIM_PROBE_DELAY_MS raises this for slow, software-rendered test sessions)
+    let delay = std::env::var("TUI_SHIM_PROBE_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(if acked { 45 } else { 200 });
+    crate::log(&format!("probe: wrapper answered={acked}, waiting {delay}ms for the frame"));
     std::thread::sleep(Duration::from_millis(delay));
-    // the marker may not be on screen yet (the editor can still be starting up): look a few
-    // times, asking again each time; the caller gives up after its own overall time limit
+    // look a few times, asking again each time; the caller gives up after its own overall time limit
     let mut marker = None;
     for attempt in 0..4 {
         if attempt > 0 {
-            let _ = UnixDatagram::unbound().ok()?.send_to(PROBE, sock);
+            let _ = UnixDatagram::unbound().ok()?.send_to(PROBE, sock); // no reply wanted this time
         }
         let shot = Command::new("grim").args(["-o", output, "-t", "ppm", "-"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
         marker = find_marker(&shot.stdout, fill);
@@ -134,7 +149,7 @@ pub fn locate(sock: &Path, fill: [u8; 3], output: &str) -> Option<Found> {
         if marker.is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(150));
     }
     let (l, t, r, _b) = marker?;
     // the marker covers the badge's fill; the 2px ring around it is part of the badge

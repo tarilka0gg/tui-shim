@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     /// margins are from the monitor's top-right corner, in logical pixels
-    Show { right: i32, top: i32, /** x of the window's right edge; 0 when unknown */ edge_x: i32, /** position worked out, not a corner fallback */ exact: bool, monitor: Option<String> },
+    Show { right: i32, top: i32, /** x of the window's right edge; 0 when unknown */ edge_x: i32, /** position worked out, not a corner fallback */ exact: bool, monitor: Option<String>, /** the editor's window */ id: u64 },
     /// the in-terminal badge was clicked (the pointer is on it); when the click arrived
     Click(Instant),
     /// F9 was pressed in the editor's terminal; when it arrived
     Hotkey(Instant),
+    /// a click or a keystroke reached the editor (so the picker is not what the user is using); when it arrived
+    Away(Instant),
     Hide,
     Quit,
 }
@@ -25,6 +27,11 @@ fn niri_json(args: &[&str]) -> Option<Value> {
 
 pub fn windows() -> Vec<Value> {
     niri_json(&["windows"]).and_then(|v| v.as_array().cloned()).unwrap_or_default()
+}
+
+/// Id of the window that has the keyboard focus right now.
+pub fn focused_window_id() -> Option<u64> {
+    niri_json(&["focused-window"]).and_then(|v| v["id"].as_u64())
 }
 
 pub fn window_ids(class: &str) -> HashSet<u64> {
@@ -125,7 +132,7 @@ fn state_for(id: u64) -> Msg {
             exact = true;
         }
     }
-    Msg::Show { right: right as i32, top: top as i32, edge_x: edge_x as i32, exact, monitor }
+    Msg::Show { right: right as i32, top: top as i32, edge_x: edge_x as i32, exact, monitor, id }
 }
 
 /// Pid of `pid`'s parent, from /proc.

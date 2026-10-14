@@ -866,7 +866,7 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                             toggle2.emit_clicked();
                         }
                     }
-                    Msg::Click(_) | Msg::Hotkey(_) => {}
+                    Msg::Click(_) | Msg::Hotkey(_) | Msg::Away(_) => {}
                     Msg::Hide => {
                         if want_hidden.get().is_none() {
                             want_hidden.set(Some(Instant::now()));
@@ -974,12 +974,14 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         // when the badge was last clicked (or F9 pressed): a click on the terminal also takes the keyboard
         // focus from the panel, which must not be mistaken for "the user went elsewhere"
         let last_badge = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
+        // the editor's own window: focus going back to it is not the user leaving
+        let editor_id = Rc::new(Cell::new(0u64));
         // how to close the panel that is open right now (slides away, remembers the view, forgets the window)
         let close_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
         let open_with: Rc<dyn Fn(Place)> = {
-            let (app, home, view, picked_file, geometry, open, on_pick, opened_at, close_slot, last_badge) =
-                (app.clone(), home.clone(), view.clone(), picked_file.clone(), geometry.clone(), open.clone(), on_pick.clone(), opened_at.clone(), close_slot.clone(), last_badge.clone());
+            let (app, home, view, picked_file, geometry, open, on_pick, opened_at, close_slot, last_badge, editor_id) =
+                (app.clone(), home.clone(), view.clone(), picked_file.clone(), geometry.clone(), open.clone(), on_pick.clone(), opened_at.clone(), close_slot.clone(), last_badge.clone(), editor_id.clone());
             Rc::new(move |place: Place| {
                 let _ = &opened_at;
                 const PANEL_W: i32 = 540;
@@ -1085,21 +1087,25 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     });
                 }
                 {
-                    // keyboard focus left the panel: the user went to another window, so close it, unless
-                    // it was the badge click itself (a second click lands on the terminal and takes the focus)
-                    let (close, w, last_badge, open) = (close.clone(), win.clone(), last_badge.clone(), open.clone());
+                    // keyboard focus left the panel. Three cases:
+                    //  - a second badge click took it (a double click): take it back;
+                    //  - it went back to the editor's own window: not the user leaving (new windows get
+                    //    focus late, focus may follow the mouse, ...): keep the panel; a click or keystroke that
+                    //    actually reaches the editor closes it (see Msg::Away);
+                    //  - it went to some other window: the user left, close.
+                    let (close, w, last_badge, open, editor_id) = (close.clone(), win.clone(), last_badge.clone(), open.clone(), editor_id.clone());
                     let seen = Cell::new(false);
                     win.connect_is_active_notify(move |win| {
                         crate::log(&format!("panel is_active={}", win.is_active()));
                         if win.is_active() {
                             seen.set(true);
                         } else if seen.get() {
-                            let (close, w, last_badge, open) = (close.clone(), w.clone(), last_badge.clone(), open.clone());
+                            let (close, w, last_badge, open, editor_id) = (close.clone(), w.clone(), last_badge.clone(), open.clone(), editor_id.clone());
                             glib::timeout_add_local_once(Duration::from_millis(35), move || {
-                                if w.is_active() {
+                                if w.is_active() || open.borrow().as_ref() != Some(&w) {
                                     return;
                                 }
-                                if last_badge.get().elapsed() < Duration::from_millis(350) && open.borrow().as_ref() == Some(&w) {
+                                if last_badge.get().elapsed() < Duration::from_millis(350) {
                                     crate::log("focus lost right after a badge click: keeping the panel and taking the focus back");
                                     w.set_keyboard_mode(KeyboardMode::Exclusive); // grabs focus at once
                                     let (w, open) = (w.clone(), open.clone());
@@ -1108,14 +1114,20 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                                             w.set_keyboard_mode(KeyboardMode::OnDemand); // clicks elsewhere work normally again
                                         }
                                     });
-                                } else {
-                                    crate::log("focus lost -> closing the panel");
-                                    close();
+                                    return;
+                                }
+                                match crate::track::focused_window_id() {
+                                    Some(id) if id == editor_id.get() => crate::log("focus went back to the editor: keeping the panel until a click or key reaches the editor"),
+                                    other => {
+                                        crate::log(&format!("focus went to another window ({other:?}) -> closing the panel"));
+                                        close();
+                                    }
                                 }
                             });
                         }
                     });
                 }
+
                 refresh();
                 win.present();
                 rev.set_reveal_child(true);
@@ -1185,13 +1197,25 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         glib::timeout_add_local(Duration::from_millis(15), move || {
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    Msg::Show { right, top, edge_x, exact, monitor } => {
+                    Msg::Show { right, top, edge_x, exact, monitor, id } => {
+                        editor_id.set(id);
                         *geometry.borrow_mut() = (right, top, edge_x, exact, monitor);
                         if !started.replace(true) {
                             toggle(Instant::now()); // an editor with no file yet: offer the picker right away
                         }
                     }
                     Msg::Click(at) | Msg::Hotkey(at) => toggle(at),
+                    Msg::Away(at) => {
+                        // a click or key reached the editor, so the user is working there: close the picker
+                        // (a click that arrives right after opening is the opening click's tail, not "away")
+                        if open.borrow().is_some() && at.saturating_duration_since(opened_at.get()) > Duration::from_millis(400) {
+                            crate::log("a click/key reached the editor -> closing the panel");
+                            let c = close_slot.borrow().clone();
+                            if let Some(c) = c {
+                                c();
+                            }
+                        }
+                    }
                     Msg::Hide => {}
                     Msg::Quit => {
                         app2.quit();
