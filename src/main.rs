@@ -161,11 +161,12 @@ fn write_helpers(cx: &Ctx, term: desktop::Term, term_bin: &str) -> Result<()> {
         }
     };
     let choose = helper("Choose TUI versions", &["choose"]);
+    let (choose_icon, edit_icon) = if icons::line_mode() { (icons::line_helper(&cx.home, "choose", &cx.pal, cx.dry)?, icons::line_helper(&cx.home, "edit", &cx.pal, cx.dry)?) } else { ("preferences-system".to_string(), "accessories-text-editor".to_string()) };
     desktop::write(
         &dir.join("tui-shim-choose.desktop"),
         &format!(
             "[Desktop Entry]\nType=Application\nName=TUI app versions\nComment=Choose system or user-installed copy of TUI apps\n\
-             Exec={choose}\nIcon=preferences-system\nTerminal=false\nCategories=Settings;\n{}\n",
+             Exec={choose}\nIcon={choose_icon}\nTerminal=false\nCategories=Settings;\n{}\n",
             desktop::MARKER
         ),
         cx.dry,
@@ -176,7 +177,7 @@ fn write_helpers(cx: &Ctx, term: desktop::Term, term_bin: &str) -> Result<()> {
         &dir.join("tui-shim-edit.desktop"),
         &format!(
             "[Desktop Entry]\nType=Application\nName=Edit in terminal...\nComment=Pick a terminal editor for a file\n\
-             Exec={edit}\nIcon=accessories-text-editor\nTerminal=false\nCategories=Utility;TextEditor;\n\
+             Exec={edit}\nIcon={edit_icon}\nTerminal=false\nCategories=Utility;TextEditor;\n\
              MimeType=text/plain;text/markdown;text/x-shellscript;application/json;application/toml;application/x-yaml;\n\
              Actions=NewFile;\n{}\n\n[Desktop Action NewFile]\nName=New file...\nExec={new}\n",
             desktop::MARKER

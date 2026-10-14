@@ -115,8 +115,35 @@ pub fn glyph(app: &App, pal: &Palette) -> String {
     )
 }
 
+/// `TUI_SHIM_LINE_ICONS=1`: every launcher gets a line drawing (see `glyph`) instead of a theme or web icon. Launchers that recolour icons to
+/// a palette role (Noctalia) turn a coloured, filled icon into a flat blob; strokes survive that. Simple Linux sets it.
+pub fn line_mode() -> bool {
+    std::env::var_os("TUI_SHIM_LINE_ICONS").is_some_and(|v| v != "0")
+}
+
+/// Installs a line drawing under `tui-shim-<id>` (unless one is there) and returns that name.
+fn install_line(home: &Path, id: &str, svg: &str, dry: bool) -> Result<String> {
+    let name = format!("tui-shim-{id}");
+    let dst = home.join(format!(".local/share/icons/hicolor/scalable/apps/{name}.svg"));
+    if !dst.exists() && !dry {
+        std::fs::create_dir_all(dst.parent().unwrap())?;
+        std::fs::write(&dst, svg)?;
+    }
+    Ok(name)
+}
+
+/// The chooser entries: a window with a tick (versions) or a pencil-less page (editor chooser), in the same line style.
+pub fn line_helper(home: &Path, id: &str, pal: &Palette, dry: bool) -> Result<String> {
+    let app = App { name: id.into(), title: id.into(), comment: String::new(), categories: if id == "edit" { vec!["TextEditor".into()] } else { vec![] },
+        keywords: vec![], icon_names: vec![], dashboard_icon: None, simple_icon: None, version_arg: None, builtin_picker: false, open_keys: None, open_quote: None, theme: Default::default() };
+    install_line(home, id, &glyph(&app, pal), dry)
+}
+
 /// Resolve the Icon= value for an app, installing/caching as needed.
 pub fn resolve(app: &App, home: &Path, pal: &Palette, dry: bool, offline: bool) -> Result<String> {
+    if line_mode() {
+        return install_line(home, &app.name, &glyph(app, pal), dry);
+    }
     if let Some(p) = find_installed(home, &app.icon_names) {
         // An icon from a theme goes by its name: launchers that recolour icons (Noctalia does) treat a file path as a flat picture and
         // turn a coloured one into a black square, but resolve a name through the theme the way they do for every other program.
