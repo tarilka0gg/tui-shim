@@ -280,18 +280,83 @@ fn tile(e: &Entry, idx: usize) -> gtk::Box {
     b
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Slide {
+    /// plain swap (typing in the filter, first fill)
+    None,
+    /// into a folder / history forward: the new view slides in from the right
+    Forward,
+    /// up / history back: the new view slides in from the left
+    Back,
+}
+
+/// Two grid pages in a stack: a listing is built on the hidden page, then slid in.
+struct Grid {
+    stack: gtk::Stack,
+    flows: [gtk::FlowBox; 2],
+    scrollers: [gtk::ScrolledWindow; 2],
+    active: Cell<usize>,
+}
+
+fn make_flow() -> gtk::FlowBox {
+    gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .homogeneous(true)
+        .min_children_per_line(COLS as u32)
+        .max_children_per_line(COLS as u32)
+        .activate_on_single_click(true)
+        .valign(gtk::Align::Start)
+        .build()
+}
+
+impl Grid {
+    fn new() -> Rc<Grid> {
+        let flows = [make_flow(), make_flow()];
+        let mk = |f: &gtk::FlowBox| gtk::ScrolledWindow::builder().child(f).vexpand(true).min_content_height(300).hscrollbar_policy(gtk::PolicyType::Never).build();
+        let scrollers = [mk(&flows[0]), mk(&flows[1])];
+        let stack = gtk::Stack::builder().hhomogeneous(true).vhomogeneous(true).transition_duration(240).vexpand(true).build();
+        if std::env::var_os("TUI_SHIM_DEBUG").is_some() {
+            let t0 = Instant::now();
+            stack.connect_transition_running_notify(move |s| {
+                eprintln!("slide: running={} at {:?} type={:?}", s.is_transition_running(), t0.elapsed(), s.transition_type());
+            });
+        }
+        stack.add_named(&scrollers[0], Some("a"));
+        stack.add_named(&scrollers[1], Some("b"));
+        Rc::new(Grid { stack, flows, scrollers, active: Cell::new(0) })
+    }
+    fn flow(&self) -> &gtk::FlowBox {
+        &self.flows[self.active.get()]
+    }
+    fn scroller(&self) -> &gtk::ScrolledWindow {
+        &self.scrollers[self.active.get()]
+    }
+    /// the page that is not on screen
+    fn hidden_flow(&self) -> &gtk::FlowBox {
+        &self.flows[1 - self.active.get()]
+    }
+    fn flip(&self, slide: Slide) {
+        self.stack.set_transition_type(match slide {
+            Slide::None => gtk::StackTransitionType::None,
+            Slide::Forward => gtk::StackTransitionType::SlideLeft,
+            Slide::Back => gtk::StackTransitionType::SlideRight,
+        });
+        let next = 1 - self.active.get();
+        self.stack.set_visible_child(&self.scrollers[next]);
+        self.active.set(next);
+    }
+}
+
 fn flat_button(icon: &str, tip: &str) -> gtk::Button {
     gtk::Button::builder().icon_name(icon).css_classes(["flat"]).tooltip_text(tip).build()
 }
 
-fn focus_first(w: &gtk::Widget) {
-    if let Some(fb) = w.downcast_ref::<gtk::FlowBox>() {
-        if let Some(c) = fb.selected_children().first().cloned().or_else(|| fb.child_at_index(0)) {
-            c.grab_focus();
-            return;
-        }
+fn focus_flow(fb: &gtk::FlowBox) {
+    if let Some(c) = fb.selected_children().first().cloned().or_else(|| fb.child_at_index(0)) {
+        c.grab_focus();
+    } else {
+        fb.grab_focus();
     }
-    w.grab_focus();
 }
 
 fn focus_in_entry(w: &impl IsA<gtk::Widget>) -> bool {
@@ -307,7 +372,7 @@ fn focus_in_entry(w: &impl IsA<gtk::Widget>) -> bool {
 
 /// Thunar-style file browser: nav buttons + path bar on top, search, and a grid of icon tiles.
 /// Returns the widget, the widget to focus when it becomes visible, and a refresh hook.
-fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>>, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, gtk::Widget, Rc<dyn Fn()>) {
+fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>>, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, Rc<dyn Fn()>, Rc<dyn Fn()>) {
     let nav = Rc::new(RefCell::new(Nav { dir: start, back: vec![], fwd: vec![], hidden: false, recent: false }));
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -320,15 +385,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
     let path = gtk::Entry::builder().hexpand(true).build();
     path.set_icon_from_icon_name(gtk::EntryIconPosition::Primary, Some("user-home-symbolic"));
     let filter = gtk::SearchEntry::builder().placeholder_text("Filter - or type a new file name").visible(false).build();
-    let flow = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::Single)
-        .homogeneous(true)
-        .min_children_per_line(COLS as u32)
-        .max_children_per_line(COLS as u32)
-        .activate_on_single_click(true)
-        .valign(gtk::Align::Start)
-        .build();
-    let scroller = gtk::ScrolledWindow::builder().child(&flow).vexpand(true).min_content_height(300).hscrollbar_policy(gtk::PolicyType::Never).build();
+    let grid = Grid::new();
 
     let bar = gtk::Box::builder().spacing(2).build();
     for b in [&back_b, &fwd_b, &up_b, &home_b] {
@@ -340,12 +397,13 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
     let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).margin_top(10).margin_bottom(10).margin_start(10).margin_end(10).build();
     root.append(&bar);
     root.append(&filter);
-    root.append(&scroller);
+    root.append(&grid.stack);
 
-    let refresh: Rc<dyn Fn()> = {
-        let (nav, entries, flow, filter, path, back_b, fwd_b, up_b, home) = (nav.clone(), entries.clone(), flow.clone(), filter.clone(), path.clone(), back_b.clone(), fwd_b.clone(), up_b.clone(), home.clone());
-        let (reveal, scroller) = (reveal.clone(), scroller.clone());
-        Rc::new(move || {
+    let refresh: Rc<dyn Fn(Slide)> = {
+        let (nav, entries, grid, filter, path, back_b, fwd_b, up_b, home) = (nav.clone(), entries.clone(), grid.clone(), filter.clone(), path.clone(), back_b.clone(), fwd_b.clone(), up_b.clone(), home.clone());
+        let reveal = reveal.clone();
+        Rc::new(move |slide: Slide| {
+            let flow = grid.hidden_flow().clone();
             flow.remove_all();
             // jump to the folder of the file opened last time and put it in view
             let target = reveal.borrow_mut().take();
@@ -372,24 +430,27 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
             fwd_b.set_sensitive(!n.fwd.is_empty());
             up_b.set_sensitive(n.dir.parent().is_some());
             let at = target.as_ref().and_then(|t| entries.borrow().iter().position(|e| &e.path == t));
-            if let Some(c) = flow.child_at_index(at.unwrap_or(0) as i32) {
-                flow.select_child(&c);
-                if at.is_some() {
-                    // wait for the layout (and the panel's slide-in) before centring the tile
-                    let (flow, scroller) = (flow.clone(), scroller.clone());
-                    glib::timeout_add_local_once(Duration::from_millis(280), move || {
-                        if let Some(b) = c.compute_bounds(&flow) {
-                            let adj = scroller.vadjustment();
-                            adj.set_value(b.y() as f64 - (adj.page_size() - b.height() as f64) / 2.0);
-                        }
-                    });
-                }
+            let chosen = flow.child_at_index(at.unwrap_or(0) as i32);
+            if let Some(c) = &chosen {
+                flow.select_child(c);
+            }
+            drop(n);
+            grid.flip(slide);
+            if let (Some(c), true) = (chosen, at.is_some()) {
+                // wait for the layout (and the panel's slide-in) before centring the tile
+                let grid = grid.clone();
+                glib::timeout_add_local_once(Duration::from_millis(280), move || {
+                    if let Some(b) = c.compute_bounds(grid.flow()) {
+                        let adj = grid.scroller().vadjustment();
+                        adj.set_value(b.y() as f64 - (adj.page_size() - b.height() as f64) / 2.0);
+                    }
+                });
             }
         })
     };
-    let go: Rc<dyn Fn(PathBuf)> = {
+    let go: Rc<dyn Fn(PathBuf, Slide)> = {
         let (nav, refresh, filter) = (nav.clone(), refresh.clone(), filter.clone());
-        Rc::new(move |to| {
+        Rc::new(move |to, slide| {
             if !to.is_dir() {
                 return;
             }
@@ -404,7 +465,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 n.recent = false;
             }
             filter.set_text("");
-            refresh();
+            refresh(slide);
         })
     };
     let go_back: Rc<dyn Fn()> = {
@@ -416,7 +477,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 let cur = std::mem::replace(&mut n.dir, prev);
                 n.fwd.push(cur);
             }
-            refresh();
+            refresh(Slide::Back);
         })
     };
     let go_fwd: Rc<dyn Fn()> = {
@@ -428,7 +489,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 let cur = std::mem::replace(&mut n.dir, next);
                 n.back.push(cur);
             }
-            refresh();
+            refresh(Slide::Forward);
         })
     };
     let go_up: Rc<dyn Fn()> = {
@@ -436,7 +497,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
         Rc::new(move || {
             let parent = nav.borrow().dir.parent().map(|p| p.to_path_buf());
             if let Some(p) = parent {
-                go(p);
+                go(p, Slide::Back);
             }
         })
     };
@@ -445,7 +506,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
         Rc::new(move |i| {
             let Some(e) = entries.borrow().get(i).cloned() else { return };
             match e.kind {
-                Kind::Dir => go(e.path),
+                Kind::Dir => go(e.path, Slide::Forward),
                 _ => on_pick(e.path),
             }
         })
@@ -465,24 +526,24 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
     });
     home_b.connect_clicked({
         let (g, h) = (go.clone(), home.clone());
-        move |_| g(h.clone())
+        move |_| g(h.clone(), Slide::Forward)
     });
     recent_b.connect_toggled({
         let (nav, refresh) = (nav.clone(), refresh.clone());
         move |b| {
             nav.borrow_mut().recent = b.is_active();
-            refresh();
+            refresh(if b.is_active() { Slide::Forward } else { Slide::Back });
         }
     });
     search_b.connect_toggled({
-        let (filter, flow) = (filter.clone(), flow.clone());
+        let (filter, grid) = (filter.clone(), grid.clone());
         move |b| {
             filter.set_visible(b.is_active());
             if b.is_active() {
                 filter.grab_focus();
             } else {
                 filter.set_text("");
-                if let Some(c) = flow.child_at_index(0) {
+                if let Some(c) = grid.flow().child_at_index(0) {
                     c.grab_focus();
                 }
             }
@@ -490,11 +551,11 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
     });
     filter.connect_search_changed({
         let r = refresh.clone();
-        move |_| r()
+        move |_| r(Slide::None)
     });
     filter.connect_activate({
-        let (a, flow) = (activate.clone(), flow.clone());
-        move |_| a(flow.selected_children().first().map(|c| c.index() as usize).unwrap_or(0))
+        let (a, grid) = (activate.clone(), grid.clone());
+        move |_| a(grid.flow().selected_children().first().map(|c| c.index() as usize).unwrap_or(0))
     });
     path.connect_changed(|p| p.remove_css_class("error"));
     path.connect_activate({
@@ -511,7 +572,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 nav.borrow().dir.join(&t)
             };
             if target.is_dir() {
-                go(target);
+                go(target, Slide::Forward);
             } else if target.parent().is_some_and(|d| d.is_dir()) {
                 on_pick(target);
             } else {
@@ -519,23 +580,26 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
             }
         }
     });
-    flow.connect_child_activated({
-        let a = activate.clone();
-        move |_, c| a(c.index() as usize)
-    });
+    for f in &grid.flows {
+        f.connect_child_activated({
+            let a = activate.clone();
+            move |_, c| a(c.index() as usize)
+        });
+    }
 
     // keyboard: Thunar-like shortcuts, arrows from the filter box, type-to-filter from the grid
     let kc = gtk::EventControllerKey::new();
     kc.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
-        let (root2, flow, scroller, filter, search_b, path, nav, refresh, entries) =
-            (root.clone(), flow.clone(), scroller.clone(), filter.clone(), search_b.clone(), path.clone(), nav.clone(), refresh.clone(), entries.clone());
-        let (g_back, g_fwd, g_up, g_home) = (go_back.clone(), go_fwd.clone(), go_up.clone(), { let (g, h) = (go.clone(), home.clone()); Rc::new(move || g(h.clone())) });
+        let (root2, grid, filter, search_b, path, nav, refresh, entries) =
+            (root.clone(), grid.clone(), filter.clone(), search_b.clone(), path.clone(), nav.clone(), refresh.clone(), entries.clone());
+        let (g_back, g_fwd, g_up, g_home) = (go_back.clone(), go_fwd.clone(), go_up.clone(), { let (g, h) = (go.clone(), home.clone()); Rc::new(move || g(h.clone(), Slide::Forward)) });
         kc.connect_key_pressed(move |_, key, _, state| {
             let alt = state.contains(gdk::ModifierType::ALT_MASK);
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let in_entry = focus_in_entry(&root2);
             let select_by = |delta: i32| {
+                let (flow, scroller) = (grid.flow(), grid.scroller());
                 let cur = flow.selected_children().first().map(|c| c.index()).unwrap_or(-1);
                 let n = entries.borrow().len() as i32;
                 if n == 0 {
@@ -543,7 +607,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 }
                 if let Some(c) = flow.child_at_index((cur + delta).clamp(0, n - 1)) {
                     flow.select_child(&c);
-                    if let Some(b) = c.compute_bounds(&flow) {
+                    if let Some(b) = c.compute_bounds(flow) {
                         let adj = scroller.vadjustment();
                         let (top, bottom) = (b.y() as f64, (b.y() + b.height()) as f64);
                         if top < adj.value() {
@@ -574,7 +638,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 gdk::Key::h | gdk::Key::H if ctrl => {
                     let h = nav.borrow().hidden;
                     nav.borrow_mut().hidden = !h;
-                    refresh();
+                    refresh(Slide::None);
                 }
                 gdk::Key::Down if in_entry => select_by(COLS),
                 gdk::Key::Up if in_entry => select_by(-COLS),
@@ -595,8 +659,30 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
         });
     }
     root.add_controller(kc);
-    let focus: gtk::Widget = flow.clone().upcast();
-    (root, focus, refresh)
+    let focus: Rc<dyn Fn()> = {
+        let grid = grid.clone();
+        Rc::new(move || focus_flow(grid.flow()))
+    };
+    let refresh_plain: Rc<dyn Fn()> = {
+        let (r, a, gb, entries) = (refresh.clone(), activate.clone(), go_back.clone(), entries.clone());
+        let demo_started = Cell::new(false);
+        Rc::new(move || {
+            r(Slide::None);
+            // debugging aid: after the first fill, walk into a folder and back so the slide can be captured
+            if std::env::var_os("TUI_SHIM_DEMO_NAV").is_some() && !demo_started.replace(true) {
+                let (a, entries) = (a.clone(), entries.clone());
+                glib::timeout_add_local_once(Duration::from_millis(9000), move || {
+                    let i = entries.borrow().iter().position(|e| e.kind == Kind::Dir);
+                    if let Some(i) = i {
+                        a(i);
+                    }
+                });
+                let gb = gb.clone();
+                glib::timeout_add_local_once(Duration::from_millis(18000), move || gb());
+            }
+        })
+    };
+    (root, focus, refresh_plain)
 }
 
 // -------------------------------------------------------------------- overlay
@@ -694,7 +780,7 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 }
                 rev.set_reveal_child(show);
                 if show {
-                    focus_first(&focus);
+                    focus();
                 }
             });
         }
