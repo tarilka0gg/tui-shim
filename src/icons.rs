@@ -90,18 +90,28 @@ pub fn download(app: &App) -> Option<(Vec<u8>, bool)> {
     None
 }
 
-/// Last resort: palette-coloured letter glyph so an entry is never blank.
+/// Marks an icon this function made, so a hook may replace it with a fresh one when the palette changes.
+pub const GLYPH_MARK: &str = "<!--tui-shim-glyph-->";
+
+/// Last resort, so an entry is never blank: a line drawing of a terminal window with a picture of the program inside. Strokes only, no
+/// filled areas and no text (launchers that tint icons would turn a filled square into a blob, and text needs a font).
 pub fn glyph(app: &App, pal: &Palette) -> String {
-    let bg = pal.get("bg_alt").unwrap_or("#DAD4C1");
-    let fg = pal.get("fg").unwrap_or("#3B342B");
+    let fg = pal.get("fg").unwrap_or("#8A8A8A");
     let ac = pal.get("accent").unwrap_or("#BD5636");
-    let ch = app.title.chars().next().unwrap_or('?').to_uppercase();
+    let line = |d: &str, c: &str| format!("<path d=\"{d}\" fill=\"none\" stroke=\"{c}\" stroke-width=\"12\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>");
+    let inner = match app.name.as_str() {
+        "btop" | "htop" | "nvtop" => [line("M84 196V152", ac), line("M116 196V112", fg), line("M148 196V132", ac), line("M180 196V92", fg)].concat(),
+        "tmux" => [line("M128 76V196", fg), line("M128 136H196", ac)].concat(),
+        _ if app.categories.iter().any(|c| c == "TextEditor") => {
+            [line("M72 100H184", fg), line("M72 136H160", fg), line("M72 172H120", fg), line("M156 164V184", ac)].concat()
+        }
+        _ => [line("M80 104L116 136L80 168", ac), line("M132 172H184", fg)].concat(),
+    };
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\">\
-         <rect width=\"256\" height=\"256\" rx=\"48\" fill=\"{bg}\"/>\
-         <rect x=\"16\" y=\"16\" width=\"224\" height=\"224\" rx=\"36\" fill=\"none\" stroke=\"{ac}\" stroke-width=\"8\"/>\
-         <text x=\"128\" y=\"176\" font-family=\"monospace\" font-weight=\"bold\" font-size=\"140\" \
-         text-anchor=\"middle\" fill=\"{fg}\">{ch}</text></svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 256 256\">{GLYPH_MARK}\
+         <rect x=\"28\" y=\"36\" width=\"200\" height=\"184\" rx=\"28\" fill=\"none\" stroke=\"{fg}\" stroke-width=\"12\"/>\
+         {}</svg>",
+        [line("M28 72H228", fg), inner].concat()
     )
 }
 
@@ -150,7 +160,17 @@ mod tests {
     fn glyph_is_svg() {
         let pal = Palette { name: "t".into(), colors: Default::default() };
         let g = glyph(&app("zzz", None, None), &pal);
-        assert!(g.starts_with("<svg") && g.contains(">Z<"));
+        assert!(g.starts_with("<svg") && g.contains(GLYPH_MARK) && !g.contains("<text"));
+    }
+    #[test]
+    #[ignore = "writes /tmp/glyph-*.svg for a look"]
+    fn dump_glyphs() {
+        let pal = Palette { name: "t".into(), colors: [("fg".to_string(), "#E0E0E0".to_string()), ("accent".to_string(), "#D0605A".to_string())].into() };
+        for (n, c) in [("btop", "Utility"), ("tmux", "Utility"), ("micro", "TextEditor"), ("yazi", "Utility")] {
+            let mut a = app(n, None, None);
+            a.categories = vec![c.into()];
+            std::fs::write(format!("/tmp/glyph-{n}.svg"), glyph(&a, &pal)).unwrap();
+        }
     }
     #[test]
     #[ignore = "needs network"]
