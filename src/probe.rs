@@ -45,23 +45,59 @@ fn ppm_header(buf: &[u8]) -> Option<(usize, usize, usize)> {
     Some((tok[1].parse().ok()?, tok[2].parse().ok()?, pos + 1))
 }
 
-/// Bounding box (left, top, right, bottom) of pixels exactly equal to `fill` in a P6 image.
+/// Bounding box (left, top, right, bottom) of the badge in a P6 image: the connected blob of
+/// pixels exactly equal to `fill` that looks like it. The colour alone is not enough (a wallpaper
+/// can contain the same colour anywhere), so candidates are grouped into connected shapes and
+/// judged on size, squareness and fill: a disc with a folder cut out of it, not a solid area.
 pub fn find_marker(ppm: &[u8], fill: [u8; 3]) -> Option<(usize, usize, usize, usize)> {
     let (w, h, off) = ppm_header(ppm)?;
     let data = ppm.get(off..off + w * h * 3)?;
-    let (mut l, mut t, mut r, mut b) = (usize::MAX, usize::MAX, 0, 0);
-    let mut n = 0;
-    for (i, px) in data.chunks_exact(3).enumerate() {
-        if px == fill {
+    let is_match = |i: usize| data[i * 3..i * 3 + 3] == fill;
+    let mut seen = vec![false; w * h];
+    let mut best: Option<(usize, (usize, usize, usize, usize))> = None; // (pixel count, bbox)
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..w * h {
+        if seen[start] || !is_match(start) {
+            continue;
+        }
+        // flood fill one blob
+        let (mut l, mut t, mut r, mut b, mut n) = (usize::MAX, usize::MAX, 0, 0, 0);
+        seen[start] = true;
+        stack.push(start);
+        while let Some(i) = stack.pop() {
             let (x, y) = (i % w, i / w);
             l = l.min(x);
             r = r.max(x);
             t = t.min(y);
             b = b.max(y);
             n += 1;
+            let mut visit = |j: usize| {
+                if !seen[j] && is_match(j) {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            };
+            if x > 0 {
+                visit(i - 1);
+            }
+            if x + 1 < w {
+                visit(i + 1);
+            }
+            if y > 0 {
+                visit(i - w);
+            }
+            if y + 1 < h {
+                visit(i + w);
+            }
+        }
+        let (bw, bh) = (r - l + 1, b - t + 1);
+        let squareish = bw * 10 >= bh * 8 && bh * 10 >= bw * 8; // within 20%
+        let fill_ratio = n as f64 / (bw * bh) as f64; // a disc is ~0.78, with the folder cut out less
+        if (14..=240).contains(&bw) && squareish && (0.3..=0.9).contains(&fill_ratio) && best.is_none_or(|(m, _)| n > m) {
+            best = Some((n, (l, t, r, b)));
         }
     }
-    (n >= 20).then_some((l, t, r, b))
+    best.map(|(_, bbox)| bbox)
 }
 
 fn output_scale(name: &str) -> Option<f64> {
@@ -114,15 +150,33 @@ mod tests {
         v
     }
 
-    #[test]
-    fn finds_the_marker_block() {
-        let img = ppm(100, 60, |x, y| if (70..90).contains(&x) && (10..30).contains(&y) { [1, 2, 3] } else { [9, 9, 9] });
-        assert_eq!(find_marker(&img, [1, 2, 3]), Some((70, 10, 89, 29)));
+    /// a round badge (disc with a hole in the middle) at (cx, cy), radius r
+    fn disc(x: usize, y: usize, cx: usize, cy: usize, r: usize) -> bool {
+        let (dx, dy) = (x as i64 - cx as i64, y as i64 - cy as i64);
+        let d2 = (dx * dx + dy * dy) as usize;
+        d2 <= r * r && d2 >= (r / 3) * (r / 3) // the folder glyph is cut out of the middle
     }
 
     #[test]
-    fn ignores_stray_pixels_and_missing_marker() {
-        let img = ppm(50, 50, |x, y| if x == 3 && y == 4 { [1, 2, 3] } else { [0, 0, 0] });
+    fn finds_the_badge_blob() {
+        let img = ppm(200, 120, |x, y| if disc(x, y, 150, 30, 20) { [1, 2, 3] } else { [9, 9, 9] });
+        assert_eq!(find_marker(&img, [1, 2, 3]), Some((130, 10, 170, 50)));
+    }
+
+    #[test]
+    fn a_wallpaper_with_the_same_colour_does_not_fool_it() {
+        // the colour also fills a large solid area and scattered specks; the badge is the small round blob
+        let img = ppm(300, 200, |x, y| {
+            let solid = (10..120).contains(&x) && (100..190).contains(&y); // big flat area of the same colour
+            let specks = (x * 7 + y * 13) % 41 == 0; // noise
+            if disc(x, y, 250, 40, 22) || solid || specks { [1, 2, 3] } else { [9, 9, 9] }
+        });
+        assert_eq!(find_marker(&img, [1, 2, 3]), Some((228, 18, 272, 62)));
+    }
+
+    #[test]
+    fn nothing_badge_like_means_no_answer() {
+        let img = ppm(80, 80, |x, y| if x == 3 && y == 4 { [1, 2, 3] } else { [0, 0, 0] });
         assert_eq!(find_marker(&img, [1, 2, 3]), None, "a couple of pixels is not a badge");
         assert_eq!(find_marker(b"not an image", [1, 2, 3]), None);
     }
