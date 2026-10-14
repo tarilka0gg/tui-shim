@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
     /// margins are from the monitor's top-right corner, in logical pixels
-    Show { right: i32, top: i32, monitor: Option<String> },
+    Show { right: i32, top: i32, /** x of the window's right edge; 0 when unknown */ edge_x: i32, monitor: Option<String> },
     Hide,
     Quit,
 }
@@ -75,7 +75,7 @@ fn state_for(id: u64) -> Msg {
     let monitor = ws.iter().find(|x| x["id"] == w["workspace_id"]).and_then(|x| x["output"].as_str().map(String::from));
     let out_w = monitor.as_deref().and_then(|m| niri_json(&["outputs"]).map(|o| o[m]["logical"]["width"].as_i64())).flatten();
     // default: monitor's top-right corner (used when the position cannot be worked out)
-    let (mut right, mut top) = (INSET, INSET);
+    let (mut right, mut top, mut edge_x) = (INSET, INSET, 0);
     if let Some(ow) = out_w {
         let size = &w["layout"]["tile_size"];
         let tile_w = size[0].as_f64().unwrap_or(0.0).round() as i64;
@@ -88,9 +88,10 @@ fn state_for(id: u64) -> Msg {
         if let (Some((x, y)), true) = (spot, tile_w > 0) {
             right = (ow - (x + tile_w)).max(0) + INSET;
             top = y + INSET;
+            edge_x = x + tile_w;
         }
     }
-    Msg::Show { right: right as i32, top: top as i32, monitor }
+    Msg::Show { right: right as i32, top: top as i32, edge_x: edge_x as i32, monitor }
 }
 
 /// Waits for the editor's window to appear (a new window of `class`), then streams Msg
@@ -130,6 +131,10 @@ pub fn spawn(class: String, before: HashSet<u64>, tx: Sender<Msg>) {
         let mut last: Option<Msg> = None;
         loop {
             let msg = state_for(id);
+            if std::env::var_os("TUI_SHIM_DEBUG").is_some() {
+                let w = windows().into_iter().find(|w| w["id"].as_u64() == Some(id));
+                eprintln!("track: {msg:?} layout={:?}", w.map(|w| w["layout"].clone()));
+            }
             if last.as_ref() != Some(&msg) {
                 if tx.send(msg.clone()).is_err() || msg == Msg::Quit {
                     break;

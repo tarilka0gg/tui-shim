@@ -244,7 +244,7 @@ struct Nav {
     recent: bool,
 }
 
-fn tile(e: &Entry) -> gtk::Box {
+fn tile(e: &Entry, idx: usize) -> gtk::Box {
     let img = match e.kind {
         Kind::Dir => gtk::Image::from_icon_name("folder"),
         Kind::New => gtk::Image::from_icon_name("document-new"),
@@ -272,6 +272,7 @@ fn tile(e: &Entry) -> gtk::Box {
         .margin_start(4)
         .margin_end(4)
         .width_request(96)
+        .css_classes(["tui-tile", &format!("tui-d{}", (idx / COLS as usize).min(5))])
         .tooltip_text(if e.detail.is_empty() { e.label.clone() } else { format!("{}\n{}", e.label, e.detail) })
         .build();
     b.append(&img);
@@ -285,7 +286,7 @@ fn flat_button(icon: &str, tip: &str) -> gtk::Button {
 
 fn focus_first(w: &gtk::Widget) {
     if let Some(fb) = w.downcast_ref::<gtk::FlowBox>() {
-        if let Some(c) = fb.child_at_index(0) {
+        if let Some(c) = fb.selected_children().first().cloned().or_else(|| fb.child_at_index(0)) {
             c.grab_focus();
             return;
         }
@@ -306,7 +307,7 @@ fn focus_in_entry(w: &impl IsA<gtk::Widget>) -> bool {
 
 /// Thunar-style file browser: nav buttons + path bar on top, search, and a grid of icon tiles.
 /// Returns the widget, the widget to focus when it becomes visible, and a refresh hook.
-fn file_panel(home: PathBuf, start: PathBuf, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, gtk::Widget, Rc<dyn Fn()>) {
+fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>>, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, gtk::Widget, Rc<dyn Fn()>) {
     let nav = Rc::new(RefCell::new(Nav { dir: start, back: vec![], fwd: vec![], hidden: false, recent: false }));
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -343,12 +344,22 @@ fn file_panel(home: PathBuf, start: PathBuf, on_pick: PickFn, on_cancel: Rc<dyn 
 
     let refresh: Rc<dyn Fn()> = {
         let (nav, entries, flow, filter, path, back_b, fwd_b, up_b, home) = (nav.clone(), entries.clone(), flow.clone(), filter.clone(), path.clone(), back_b.clone(), fwd_b.clone(), up_b.clone(), home.clone());
+        let (reveal, scroller) = (reveal.clone(), scroller.clone());
         Rc::new(move || {
             flow.remove_all();
+            // jump to the folder of the file opened last time and put it in view
+            let target = reveal.borrow_mut().take();
+            if let Some(parent) = target.as_ref().and_then(|t| t.parent()) {
+                let mut n = nav.borrow_mut();
+                n.dir = parent.to_path_buf();
+                n.recent = false;
+            }
             let n = nav.borrow();
             let found = files::view(&home, &n.dir, n.hidden, n.recent, &filter.text());
+            let mut flow_idx = 0usize;
             for e in &found {
-                flow.append(&tile(e));
+                flow.append(&tile(e, flow_idx));
+                flow_idx += 1;
             }
             *entries.borrow_mut() = found;
             let mut shown = n.dir.display().to_string();
@@ -360,8 +371,19 @@ fn file_panel(home: PathBuf, start: PathBuf, on_pick: PickFn, on_cancel: Rc<dyn 
             back_b.set_sensitive(!n.back.is_empty());
             fwd_b.set_sensitive(!n.fwd.is_empty());
             up_b.set_sensitive(n.dir.parent().is_some());
-            if let Some(c) = flow.child_at_index(0) {
+            let at = target.as_ref().and_then(|t| entries.borrow().iter().position(|e| &e.path == t));
+            if let Some(c) = flow.child_at_index(at.unwrap_or(0) as i32) {
                 flow.select_child(&c);
+                if at.is_some() {
+                    // wait for the layout (and the panel's slide-in) before centring the tile
+                    let (flow, scroller) = (flow.clone(), scroller.clone());
+                    glib::timeout_add_local_once(Duration::from_millis(280), move || {
+                        if let Some(b) = c.compute_bounds(&flow) {
+                            let adj = scroller.vadjustment();
+                            adj.set_value(b.y() as f64 - (adj.page_size() - b.height() as f64) / 2.0);
+                        }
+                    });
+                }
             }
         })
     };
@@ -595,21 +617,30 @@ fn monitor_by_name(name: &str) -> Option<gdk::Monitor> {
 
 /// Folder button pinned (via layer-shell) to the top-right of the tracked editor window.
 /// It expands into the file panel in place and goes away with the window.
+const OVERLAY_CSS: &str = r#"
+window.tui-overlay { background: transparent; box-shadow: none; }
+.tui-root { transition: opacity 200ms ease-in-out; }
+.tui-root.tui-away { opacity: 0; }
+.tui-fab { background: @card_bg_color; color: @window_fg_color; border: 1px solid alpha(@window_fg_color, 0.25); border-radius: 999px; min-width: 24px; min-height: 24px; padding: 3px; opacity: 0.85; box-shadow: none; outline: none; transition: opacity 160ms, border-color 160ms; }
+.tui-fab:hover { opacity: 1; border-color: @accent_bg_color; }
+.tui-fab:focus-visible { outline: none; }
+.tui-panel { background: @window_bg_color; color: @window_fg_color; border: 1px solid alpha(@window_fg_color, 0.25); border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.35); }
+.tui-panel label, .tui-panel entry, .tui-panel text, .tui-panel button { color: @window_fg_color; }
+@keyframes tui-pop { from { opacity: 0; } to { opacity: 1; } }
+.tui-tile { animation: tui-pop 220ms ease-out; animation-fill-mode: backwards; }
+.tui-d1 { animation-delay: 30ms; } .tui-d2 { animation-delay: 60ms; } .tui-d3 { animation-delay: 90ms; }
+.tui-d4 { animation-delay: 120ms; } .tui-d5 { animation-delay: 150ms; }
+flowboxchild { transition: background 120ms; border-radius: 10px; }
+"#;
+
 pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
     let OverlayCfg { home, start, pal, on_pick, expand_on_start } = cfg;
     let rx = Rc::new(rx);
     launch(pal, move |app| {
-        let (rx, on_pick, start) = (rx.clone(), on_pick.clone(), start.clone());
+        let (rx, on_pick) = (rx.clone(), on_pick.clone());
         if let Some(display) = gdk::Display::default() {
             let prov = gtk::CssProvider::new();
-            prov.load_from_string(
-                "window.tui-overlay { background: transparent; box-shadow: none; }\
-                 .tui-fab { background: @card_bg_color; color: @window_fg_color; border: 1px solid alpha(@window_fg_color, 0.25); border-radius: 999px; min-width: 24px; min-height: 24px; padding: 3px; opacity: 0.85; box-shadow: none; outline: none; }\
-                 .tui-fab:hover { opacity: 1; border-color: @accent_bg_color; }\
-                 .tui-fab:focus-visible { outline: none; }\
-                 .tui-panel { background: @window_bg_color; color: @window_fg_color; border: 1px solid alpha(@window_fg_color, 0.25); border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.35); }\
-                 .tui-panel label, .tui-panel entry, .tui-panel text, .tui-panel button { color: @window_fg_color; }",
-            );
+            prov.load_from_string(OVERLAY_CSS);
             gtk::style_context_add_provider_for_display(&display, &prov, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
         }
         let win = gtk::ApplicationWindow::builder().application(app).decorated(false).resizable(false).css_classes(["tui-overlay"]).build();
@@ -621,45 +652,53 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         win.set_keyboard_mode(KeyboardMode::None);
         win.set_namespace(Some("tui-shim-overlay"));
 
+        // where the user left off: the folder of the file opened last, with that file selected
+        let last = files::recent(&home).into_iter().next();
+        let start = last.as_ref().and_then(|l| l.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| start.clone());
+        let reveal: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(last));
+
         let touched = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
-        let panel_slot: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
+        let rev_slot: Rc<RefCell<Option<gtk::Revealer>>> = Rc::new(RefCell::new(None));
         let collapse: Rc<dyn Fn()> = {
-            let (slot, win) = (panel_slot.clone(), win.clone());
+            let (slot, win) = (rev_slot.clone(), win.clone());
             Rc::new(move || {
-                if let Some(p) = slot.borrow().as_ref() {
-                    p.set_visible(false);
+                if let Some(r) = slot.borrow().as_ref() {
+                    r.set_reveal_child(false);
                 }
                 win.set_keyboard_mode(KeyboardMode::None);
             })
         };
-        let (c, t, h) = (collapse.clone(), touched.clone(), home.clone());
+        let (c, t, h, rv) = (collapse.clone(), touched.clone(), home.clone(), reveal.clone());
         let picked: PickFn = Rc::new(move |p| {
             c();
             t.set(Instant::now());
             files::push_recent(&h, &p);
+            *rv.borrow_mut() = Some(p.clone()); // next time the panel opens on this file
             on_pick(p);
         });
-        let (panel, focus, refresh) = file_panel(home.clone(), start, picked, collapse.clone());
+        let (panel, focus, refresh) = file_panel(home.clone(), start, reveal.clone(), picked, collapse.clone());
         panel.add_css_class("tui-panel");
         panel.set_width_request(540);
-        panel.set_visible(false);
-        *panel_slot.borrow_mut() = Some(panel.clone());
+        let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).transition_duration(220).child(&panel).build();
+        *rev_slot.borrow_mut() = Some(rev.clone());
 
         let toggle = gtk::Button::builder().icon_name("folder-open-symbolic").css_classes(["tui-fab"]).halign(gtk::Align::End).tooltip_text("Open a file").build();
         {
-            let (panel, focus, refresh, t, win) = (panel.clone(), focus.clone(), refresh.clone(), touched.clone(), win.clone());
+            let (rev, focus, refresh, t, win) = (rev.clone(), focus.clone(), refresh.clone(), touched.clone(), win.clone());
             toggle.connect_clicked(move |_| {
                 t.set(Instant::now());
-                let show = !panel.is_visible();
-                panel.set_visible(show);
+                let show = !rev.reveals_child();
                 win.set_keyboard_mode(if show { KeyboardMode::OnDemand } else { KeyboardMode::None });
                 if show {
                     refresh();
+                }
+                rev.set_reveal_child(show);
+                if show {
                     focus_first(&focus);
                 }
             });
         }
-        let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+        let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).css_classes(["tui-root", "tui-away"]).build();
         // any pointer or key activity on the overlay counts as "in use"
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion({
@@ -678,27 +717,45 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         });
         root.add_controller(keys);
         root.append(&toggle);
-        root.append(&panel);
+        root.append(&rev);
         win.set_child(Some(&root));
 
-        // debugging aid: open the panel as soon as the overlay first shows
         let auto_expand = Cell::new(expand_on_start || std::env::var_os("TUI_SHIM_OVERLAY_EXPANDED").is_some());
-        let toggle2 = toggle.clone();
+        let (toggle2, panel) = (toggle.clone(), panel.clone());
         let (w, app2, t) = (win.clone(), app.clone(), touched.clone());
-        // set while the editor is not focused; the overlay goes away once it has been idle a moment
-        let want_hidden: Cell<Option<Instant>> = Cell::new(None);
+        // set while the editor is not focused; the overlay fades out once it has been idle a moment
+        let want_hidden: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         glib::timeout_add_local(Duration::from_millis(80), move || {
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    Msg::Show { right, top, monitor } => {
+                    Msg::Show { right, top, edge_x, monitor } => {
                         want_hidden.set(None);
-                        w.set_margin(Edge::Right, right);
+                        // expand leftwards from the window's right edge; if there is no room
+                        // for the panel on that side (narrow window on the left), expand rightwards
+                        if edge_x == 0 || edge_x >= 440 {
+                            w.set_anchor(Edge::Left, false);
+                            w.set_anchor(Edge::Right, true);
+                            w.set_margin(Edge::Right, right);
+                            toggle2.set_halign(gtk::Align::End);
+                            panel.set_width_request(if edge_x == 0 { 540 } else { (edge_x - 12).clamp(440, 540) });
+                        } else {
+                            w.set_anchor(Edge::Right, false);
+                            w.set_anchor(Edge::Left, true);
+                            w.set_margin(Edge::Left, (edge_x - 6 - 28).max(0));
+                            toggle2.set_halign(gtk::Align::Start);
+                            panel.set_width_request(440);
+                        }
                         w.set_margin(Edge::Top, top);
                         if let Some(mon) = monitor.as_deref().and_then(monitor_by_name) {
                             w.set_monitor(Some(&mon));
                         }
-                        if !w.is_visible() {
+                        if w.is_visible() {
+                            root.remove_css_class("tui-away");
+                        } else {
+                            root.add_css_class("tui-away");
                             w.present();
+                            let r = root.clone();
+                            glib::timeout_add_local_once(Duration::from_millis(40), move || r.remove_css_class("tui-away"));
                         }
                         if auto_expand.replace(false) {
                             toggle2.emit_clicked();
@@ -718,9 +775,15 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
             // clicking the overlay takes focus from the editor, so only hide when it is idle
             if let Some(since) = want_hidden.get() {
                 let in_use = w.is_active() || t.get().elapsed() < Duration::from_secs(3);
-                if w.is_visible() && since.elapsed() >= Duration::from_millis(600) && !in_use {
+                if w.is_visible() && !root.has_css_class("tui-away") && since.elapsed() >= Duration::from_millis(600) && !in_use {
                     collapse();
-                    w.set_visible(false);
+                    root.add_css_class("tui-away"); // fade out, then unmap
+                    let (w2, wh) = (w.clone(), want_hidden.clone());
+                    glib::timeout_add_local_once(Duration::from_millis(240), move || {
+                        if wh.get().is_some() {
+                            w2.set_visible(false);
+                        }
+                    });
                 }
             }
             glib::ControlFlow::Continue
