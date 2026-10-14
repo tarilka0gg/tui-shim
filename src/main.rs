@@ -27,7 +27,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about = "Scan for TUI apps, make desktop entries, icons and themes")]
 struct Cli {
-    /// Palette file (markdown tables); default ~/.config/futuro-darko/palette.md
+    /// Palette file (markdown tables); default ~/.config/tui-shim/palette.md, else ~/.config/futuro-darko/palette.md
     #[arg(long, env = "TUI_SHIM_PALETTE", global = true)]
     palette: Option<PathBuf>,
     /// Show what would change without touching anything
@@ -536,7 +536,7 @@ fn run_shim(name: &str) -> Result<()> {
         let err = std::process::Command::new(&real).args(&args).exec();
         bail!("cannot start {}: {err}", real.display());
     }
-    let pal_path = home.join(".config/futuro-darko/palette.md");
+    let pal_path = default_palette(&home);
     let pal = Palette::from_markdown(&pal_path).ok();
     let use_gui = cfg!(feature = "gui") && (std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some());
     let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry: false, offline: true };
@@ -599,7 +599,7 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unset")?);
-    let pal_path = cli.palette.clone().unwrap_or_else(|| home.join(".config/futuro-darko/palette.md"));
+    let pal_path = cli.palette.clone().unwrap_or_else(|| default_palette(&home));
     let apps = registry::load()?;
     let dry = cli.dry_run;
     let use_gui = cfg!(feature = "gui")
@@ -727,4 +727,10 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `~/.config/tui-shim/palette.md` (Simple Linux writes it from the wallpaper colours), else the author's `futuro-darko` one.
+fn default_palette(home: &std::path::Path) -> PathBuf {
+    let own = home.join(".config/tui-shim/palette.md");
+    if own.is_file() { own } else { home.join(".config/futuro-darko/palette.md") }
 }
