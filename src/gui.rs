@@ -277,6 +277,16 @@ fn tile(e: &Entry, idx: usize) -> gtk::Box {
         .build();
     b.append(&img);
     b.append(&label);
+    if !e.parent.is_empty() {
+        // search hit from a sub-folder: show where it lives
+        let from = gtk::Label::builder()
+            .label(format!("in {}", e.parent))
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .max_width_chars(12)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        b.append(&from);
+    }
     b
 }
 
@@ -404,6 +414,7 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
     let refresh: Rc<dyn Fn(Slide)> = {
         let (nav, entries, grid, filter, path, back_b, fwd_b, up_b, home) = (nav.clone(), entries.clone(), grid.clone(), filter.clone(), path.clone(), back_b.clone(), fwd_b.clone(), up_b.clone(), home.clone());
         let (reveal, scroll) = (reveal.clone(), scroll.clone());
+        let search_gen = Rc::new(std::cell::Cell::new(0u64));
         Rc::new(move |slide: Slide| {
             let flow = grid.hidden_flow().clone();
             flow.remove_all();
@@ -422,6 +433,42 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
                 flow_idx += 1;
             }
             *entries.borrow_mut() = found;
+            // typing in a normal folder: also look inside sub-folders, off the UI thread
+            let query = filter.text().trim().to_string();
+            let id = search_gen.get() + 1;
+            search_gen.set(id);
+            if !query.is_empty() && !n.recent {
+                let (root, hidden, home2) = (n.dir.clone(), n.hidden, home.clone());
+                let (tx, rx) = std::sync::mpsc::channel();
+                let q2 = query.clone();
+                std::thread::spawn(move || {
+                    let mut hits = files::search(&root, &q2, hidden, Duration::from_millis(1500));
+                    hits.push(files::new_file_entry(&home2, &root, &q2));
+                    let _ = tx.send(hits);
+                });
+                let (gen_c, entries, grid) = (search_gen.clone(), entries.clone(), grid.clone());
+                glib::timeout_add_local(Duration::from_millis(30), move || {
+                    if gen_c.get() != id {
+                        return glib::ControlFlow::Break;
+                    }
+                    match rx.try_recv() {
+                        Ok(hits) => {
+                            let flow = grid.flow().clone();
+                            flow.remove_all();
+                            for (i, e) in hits.iter().enumerate() {
+                                flow.append(&tile(e, i));
+                            }
+                            if let Some(c) = flow.child_at_index(0) {
+                                flow.select_child(&c);
+                            }
+                            *entries.borrow_mut() = hits;
+                            glib::ControlFlow::Break
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(_) => glib::ControlFlow::Break,
+                    }
+                });
+            }
             let mut shown = n.dir.display().to_string();
             if !shown.ends_with('/') {
                 shown.push('/');
@@ -561,6 +608,11 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
         let r = refresh.clone();
         move |_| r(Slide::None)
     });
+    if let Ok(q) = std::env::var("TUI_SHIM_TEST_QUERY") {
+        // test hook: start with the filter already typed
+        filter.set_visible(true);
+        filter.set_text(&q);
+    }
     filter.connect_activate({
         let (a, grid) = (activate.clone(), grid.clone());
         move |_| a(grid.flow().selected_children().first().map(|c| c.index() as usize).unwrap_or(0))

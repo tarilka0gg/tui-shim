@@ -92,7 +92,7 @@ mod tests {
     use super::*;
     #[test]
     fn parses_and_renders() {
-        let dir = std::env::temp_dir().join("tui-shim-pal-test.md");
+        let dir = std::env::temp_dir().join(format!("tui-shim-pal-test-{}.md", std::process::id()));
         std::fs::write(&dir, "| `bg` | `#BCC6B7` | x |\n| `fg` | `#3B342B` | x |\n| `accent` | `#BD5636` | x |\n## ANSI\n| red | `#BD5636` | `#BD5636` |\n").unwrap();
         let p = Palette::from_markdown(&dir).unwrap();
         assert_eq!(p.render("{{bg}}-{{ansi_red_bright}}").unwrap(), "#BCC6B7-#BD5636");
