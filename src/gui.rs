@@ -1095,11 +1095,11 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                             seen.set(true);
                         } else if seen.get() {
                             let (close, w, last_badge, open) = (close.clone(), w.clone(), last_badge.clone(), open.clone());
-                            glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                            glib::timeout_add_local_once(Duration::from_millis(35), move || {
                                 if w.is_active() {
                                     return;
                                 }
-                                if last_badge.get().elapsed() < Duration::from_millis(900) && open.borrow().as_ref() == Some(&w) {
+                                if last_badge.get().elapsed() < Duration::from_millis(350) && open.borrow().as_ref() == Some(&w) {
                                     crate::log("focus lost right after a badge click: keeping the panel and taking the focus back");
                                     w.set_keyboard_mode(KeyboardMode::Exclusive); // grabs focus at once
                                     let (w, open) = (w.clone(), open.clone());

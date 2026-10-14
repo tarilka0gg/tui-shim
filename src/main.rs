@@ -404,8 +404,8 @@ pub fn log(line: &str) {
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         use std::io::Write;
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() % 100000).unwrap_or(0);
-        let _ = writeln!(f, "[{t}] pid={} {line}", std::process::id());
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() % 100_000_000).unwrap_or(0);
+        let _ = writeln!(f, "[{}.{:03}] pid={} {line}", t / 1000, t % 1000, std::process::id());
     }
 }
 
