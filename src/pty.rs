@@ -268,12 +268,15 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
     let (mut filter, mut editor_mouse) = (InputFilter::default(), false);
     let (mut dirty, mut last_out) = (deco.is_some(), Instant::now());
     let (mut alt, mut uploaded): (bool, Option<(bool, u32)>) = (false, None);
+    let mut last_winch: Option<Instant> = None;
+    let mut dirty_since: Option<Instant> = None;
     let (mut probe_req, mut probe_until, mut marker_uploaded): (bool, Option<Instant>, Option<(bool, u32)>) = (false, None, None);
     let mut buf = [0u8; 8192];
     'outer: loop {
         if WINCH.swap(false, Ordering::Relaxed) {
             copy_size(0, m); // the kernel signals the editor's foreground group itself
             dirty = true;
+            last_winch = Some(Instant::now());
         }
         let mut fds = [
             libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
@@ -281,7 +284,8 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             libc::pollfd { fd: dg_fd, events: libc::POLLIN, revents: 0 },
         ];
         // SAFETY: fds is a valid array of 3 pollfds.
-        unsafe { libc::poll(fds.as_mut_ptr(), 3, 100) };
+        // wake quickly while the badge is waiting to be redrawn, lazily otherwise
+        unsafe { libc::poll(fds.as_mut_ptr(), 3, if dirty { 15 } else { 100 }) };
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             // SAFETY: buf is valid for its length.
             let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
@@ -345,7 +349,16 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             write_all(1, format!("\x1b_Ga=d,d=i,i={MARKER_ID},p=2,q=2\x1b\\").as_bytes());
             probe_until = None;
         }
-        if dirty && last_out.elapsed() >= Duration::from_millis(120) {
+        // while the window is being resized the editor repaints all the time: redraw in the gaps
+        // (a short quiet is enough) so the badge follows the new width instead of waiting for the end
+        let resizing = last_winch.is_some_and(|t| t.elapsed() < Duration::from_millis(800));
+        let quiet = Duration::from_millis(if resizing { 12 } else { 120 });
+        if dirty && dirty_since.is_none() {
+            dirty_since = Some(Instant::now());
+        }
+        // an editor that repaints all the time never goes quiet: after a while draw between two reads anyway
+        let starved = dirty_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(300)) && last_out.elapsed() >= Duration::from_millis(3);
+        if dirty && (last_out.elapsed() >= quiet || starved) {
             if let Some(d) = &deco {
                 match current_badge(0) {
                     Some(b) => {
@@ -368,6 +381,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                 }
             }
             dirty = false;
+            dirty_since = None;
         }
     }
     if deco.is_some() {
