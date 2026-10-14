@@ -470,7 +470,7 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
             log(&format!("terminal mode: badge={badge} TERM_PROGRAM={:?} TERM={:?} window={id}", std::env::var("TERM_PROGRAM").ok(), std::env::var("TERM").ok()));
             let deco = badge.then(|| {
                 let pal = th.palette();
-                pty::Deco { rgba: icon::folder_icon(64, pal_rgb(pal, "bg_alt", "#DAD4C1"), pal_rgb(pal, "fg", "#3B342B"), pal_rgb(pal, "secondary", "#7D8278")), px: 64, ctl: ctl.clone() }
+                pty::Deco { bg: pal_rgb(pal, "bg_alt", "#DAD4C1"), fg: pal_rgb(pal, "fg", "#3B342B"), ring: pal_rgb(pal, "secondary", "#7D8278"), ctl: ctl.clone() }
             });
             let (sock2, argv2) = (sock.clone(), argv.clone());
             silence_stderr();
@@ -672,7 +672,7 @@ fn main() -> Result<()> {
         Cmd::PtyRun { ctl, badge, sock, argv } => {
             let deco = ctl.clone().zip(badge.as_deref()).and_then(|(ctl, b)| {
                 let c: Vec<[u8; 3]> = b.split(',').filter_map(icon::parse_hex).collect();
-                (c.len() == 3).then(|| pty::Deco { rgba: icon::folder_icon(64, c[0], c[1], c[2]), px: 64, ctl })
+                (c.len() == 3).then(|| pty::Deco { bg: c[0], fg: c[1], ring: c[2], ctl })
             });
             std::process::exit(pty::run(sock, argv, deco)?);
         }

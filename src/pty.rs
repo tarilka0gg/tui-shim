@@ -53,35 +53,75 @@ fn write_all(fd: RawFd, mut buf: &[u8]) {
 /// The in-terminal button: a folder badge in the top-right cells (kitty graphics protocol).
 /// Clicks on it are taken out of the editor's input and reported on `ctl`.
 pub struct Deco {
-    pub rgba: Vec<u8>,
-    pub px: usize,
+    pub bg: [u8; 3],
+    pub fg: [u8; 3],
+    pub ring: [u8; 3],
     pub ctl: PathBuf,
+}
+
+/// Where the badge sits, in the terminal's cells and pixels.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Badge {
+    /// image edge in pixels
+    pub n: u32,
+    /// 1-based cell holding the image's top-left corner, and the pixel offset inside that cell
+    pub col: u32,
+    pub row: u32,
+    pub xo: u32,
+    pub yo: u32,
+    /// inclusive 1-based cell rectangle a click counts on
+    pub hit: (u32, u32, u32, u32),
+}
+
+/// Badge about 1.6 cells tall, one cell (about 20px) away from the top and right edges of the
+/// terminal grid. None when the terminal does not report pixel sizes.
+pub fn badge_geometry(cols: u16, rows: u16, xpix: u16, ypix: u16) -> Option<Badge> {
+    if cols == 0 || rows == 0 || xpix == 0 || ypix == 0 {
+        return None;
+    }
+    let (cw, ch) = (xpix as f64 / cols as f64, ypix as f64 / rows as f64);
+    let n = (ch * 1.6).round();
+    let gap = ch.round();
+    let (x, y) = (xpix as f64 - gap - n, gap);
+    let (col0, row0) = ((x / cw).floor(), (y / ch).floor());
+    let (xo, yo) = ((x - col0 * cw).round().min(cw.floor() - 1.0).max(0.0), (y - row0 * ch).round().min(ch.floor() - 1.0).max(0.0));
+    let c1 = ((x + n - 1.0) / cw).floor() + 1.0;
+    let r1 = ((y + n - 1.0) / ch).floor() + 1.0;
+    Some(Badge { n: n as u32, col: col0 as u32 + 1, row: row0 as u32 + 1, xo: xo as u32, yo: yo as u32, hit: (col0 as u32 + 1, c1 as u32, row0 as u32 + 1, r1 as u32) })
+}
+
+fn winsize(fd: RawFd) -> (u16, u16, u16, u16) {
+    // SAFETY: plain ioctl with a zeroed winsize.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 { (ws.ws_col, ws.ws_row, ws.ws_xpixel, ws.ws_ypixel) } else { (0, 0, 0, 0) }
+    }
+}
+
+fn cols_of(fd: RawFd) -> u16 {
+    winsize(fd).0
+}
+
+fn current_badge(fd: RawFd) -> Option<Badge> {
+    let (c, r, x, y) = winsize(fd);
+    badge_geometry(c, r, x, y)
 }
 
 const IMG_ID: u32 = 77;
 
-fn upload_icon(d: &Deco) {
-    let b64 = crate::icon::base64(&d.rgba);
+fn upload_icon(rgba: &[u8], px: u32) {
+    let b64 = crate::icon::base64(rgba);
     let chunks: Vec<&str> = b64.as_bytes().chunks(4096).map(|c| std::str::from_utf8(c).unwrap()).collect();
     for (i, c) in chunks.iter().enumerate() {
         let more = if i + 1 < chunks.len() { 1 } else { 0 };
-        let ctl = if i == 0 { format!("a=t,f=32,s={px},v={px},i={IMG_ID},q=2,m={more}", px = d.px) } else { format!("m={more}") };
+        let ctl = if i == 0 { format!("a=t,f=32,s={px},v={px},i={IMG_ID},q=2,m={more}") } else { format!("m={more}") };
         write_all(1, format!("\x1b_G{ctl};{c}\x1b\\").as_bytes());
     }
 }
 
-fn draw_icon(cols: u16) {
-    // save cursor, go to the top-right two cells, place (replace) the image, restore the cursor
-    let col = cols.saturating_sub(1).max(1);
-    write_all(1, format!("\x1b7\x1b[1;{col}H\x1b_Ga=p,i={IMG_ID},p=1,c=2,r=1,C=1,z=1000,q=2\x1b\\\x1b8").as_bytes());
-}
-
-fn cols_of(fd: RawFd) -> u16 {
-    // SAFETY: plain ioctl with a zeroed winsize.
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 { ws.ws_col } else { 0 }
-    }
+fn draw_icon(b: &Badge) {
+    // save cursor, go to the badge's cell, place (replace) the image at its pixel offset, restore
+    write_all(1, format!("\x1b7\x1b[{};{}H\x1b_Ga=p,i={IMG_ID},p=1,X={},Y={},C=1,z=1000,q=2\x1b\\\x1b8", b.row, b.col, b.xo, b.yo).as_bytes());
 }
 
 /// Splits mouse reports on the badge from everything else in the terminal's input.
@@ -99,9 +139,9 @@ pub struct Filtered {
 }
 
 impl InputFilter {
-    /// `cols` is the terminal width; `editor_mouse` says whether the editor asked for mouse input
+    /// `hit` is the badge's cell rectangle (col0, col1, row0, row1); `editor_mouse` says whether the editor asked for mouse input
     /// (otherwise mouse reports are dropped, as the editor never wanted them).
-    pub fn feed(&mut self, data: &[u8], cols: u16, editor_mouse: bool) -> Filtered {
+    pub fn feed(&mut self, data: &[u8], hit: (u32, u32, u32, u32), editor_mouse: bool) -> Filtered {
         let mut buf = std::mem::take(&mut self.carry);
         buf.extend_from_slice(data);
         let (mut forward, mut clicked, mut hotkey) = (Vec::with_capacity(buf.len()), false, false);
@@ -134,7 +174,7 @@ impl InputFilter {
                 continue;
             }
             let params: Vec<u32> = std::str::from_utf8(&buf[start + 3..j]).unwrap_or("").split(';').filter_map(|p| p.parse().ok()).collect();
-            let on_badge = matches!(params[..], [b, x, 1] if b & 0b1100011 == 0 && x + 1 >= cols as u32 && x <= cols as u32);
+            let on_badge = matches!(params[..], [b, x, y] if b & 0b1100011 == 0 && (hit.0..=hit.1).contains(&x) && (hit.2..=hit.3).contains(&y));
             if on_badge {
                 clicked |= buf[j] == b'M';
             } else if editor_mouse {
@@ -226,7 +266,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
     let ctl = UnixDatagram::unbound()?;
     let (mut filter, mut editor_mouse) = (InputFilter::default(), false);
     let (mut dirty, mut last_out) = (deco.is_some(), Instant::now());
-    let (mut alt, mut uploaded_on_alt): (bool, Option<bool>) = (false, None);
+    let (mut alt, mut uploaded): (bool, Option<(bool, u32)>) = (false, None);
     let mut buf = [0u8; 8192];
     'outer: loop {
         if WINCH.swap(false, Ordering::Relaxed) {
@@ -248,10 +288,15 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                 break 'outer;
             }
             if deco.is_some() {
-                let f = filter.feed(&buf[..n as usize], cols_of(0), editor_mouse);
+                // fallback when the terminal reports no pixel size: the old two-cell badge in row 1
+                let hit = current_badge(0).map(|b| b.hit).unwrap_or_else(|| {
+                    let c = cols_of(0) as u32;
+                    (c.saturating_sub(1), c, 1, 1)
+                });
+                let f = filter.feed(&buf[..n as usize], hit, editor_mouse);
                 write_all(m, &f.forward);
                 if f.clicked || f.hotkey {
-                    crate::log(&format!("wrapper: badge {} (cols={})", if f.clicked { "click" } else { "F9" }, cols_of(0)));
+                    crate::log(&format!("wrapper: badge {} hit={hit:?} badge={:?}", if f.clicked { "click" } else { "F9" }, current_badge(0)));
                     let _ = ctl.send_to(if f.clicked { b"click" } else { b"key" }, &deco.as_ref().unwrap().ctl);
                 }
             } else {
@@ -279,12 +324,26 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         // in the middle of one of the editor's escape sequences
         if dirty && last_out.elapsed() >= Duration::from_millis(120) {
             if let Some(d) = &deco {
-                if uploaded_on_alt != Some(alt) {
-                    upload_icon(d); // image storage is per screen: (re)send after a screen switch
-                    uploaded_on_alt = Some(alt);
+                match current_badge(0) {
+                    Some(b) => {
+                        if uploaded != Some((alt, b.n)) {
+                            // image storage is per screen, and the size follows the font: (re)send
+                            upload_icon(&crate::icon::folder_icon(b.n as usize, d.bg, d.fg, d.ring), b.n);
+                            uploaded = Some((alt, b.n));
+                        }
+                        draw_icon(&b);
+                    }
+                    None => {
+                        // no pixel size known: two cells wide, one tall, in the corner
+                        if uploaded != Some((alt, 0)) {
+                            upload_icon(&crate::icon::folder_icon(64, d.bg, d.fg, d.ring), 64);
+                            uploaded = Some((alt, 0));
+                        }
+                        let col = cols_of(0).saturating_sub(1).max(1);
+                        write_all(1, format!("\x1b7\x1b[1;{col}H\x1b_Ga=p,i={IMG_ID},p=1,c=2,r=1,C=1,z=1000,q=2\x1b\\\x1b8").as_bytes());
+                    }
                 }
             }
-            draw_icon(cols_of(0));
             dirty = false;
         }
     }
@@ -304,11 +363,26 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
 mod tests {
     use super::*;
 
+    /// cells a click counts on: columns 79-80, rows 1-2
+    const HIT: (u32, u32, u32, u32) = (79, 80, 1, 2);
+
+    #[test]
+    fn badge_geometry_keeps_a_cell_sized_gap_to_the_top_and_right() {
+        // 80x24 cells of 10x20 px
+        let b = badge_geometry(80, 24, 800, 480).unwrap();
+        assert_eq!(b.n, 32); // 1.6 cells tall
+        let (x, y) = ((b.col - 1) * 10 + b.xo, (b.row - 1) * 20 + b.yo);
+        assert_eq!(800 - (x + b.n), 20, "20px from the right edge");
+        assert_eq!(y, 20, "20px from the top edge");
+        assert!(b.hit.0 <= b.col && b.hit.1 >= 80 - 2 && b.hit.2 == 2);
+        assert!(badge_geometry(80, 24, 0, 0).is_none());
+    }
+
     #[test]
     fn badge_click_is_taken_and_reported() {
         let mut f = InputFilter::default();
         // left press and release on column 80 of an 80-column terminal, row 1
-        let r = f.feed(b"\x1b[<0;80;1M\x1b[<0;80;1m", 80, true);
+        let r = f.feed(b"\x1b[<0;80;1M\x1b[<0;80;1m", HIT, true);
         assert!(r.clicked);
         assert!(r.forward.is_empty());
     }
@@ -316,28 +390,28 @@ mod tests {
     #[test]
     fn other_mouse_events_pass_through_only_when_editor_wants_them() {
         let mut f = InputFilter::default();
-        let r = f.feed(b"\x1b[<0;10;5M", 80, true);
+        let r = f.feed(b"\x1b[<0;10;5M", HIT, true);
         assert!(!r.clicked);
         assert_eq!(r.forward, b"\x1b[<0;10;5M");
-        let r = f.feed(b"\x1b[<0;10;5M", 80, false);
+        let r = f.feed(b"\x1b[<0;10;5M", HIT, false);
         assert!(r.forward.is_empty());
     }
 
     #[test]
     fn keys_and_other_escapes_are_untouched_and_splits_are_carried() {
         let mut f = InputFilter::default();
-        let r = f.feed(b"abc\x1b[A\x1b", 80, true);
+        let r = f.feed(b"abc\x1b[A\x1b", HIT, true);
         assert_eq!(r.forward, b"abc\x1b[A\x1b");
-        let r = f.feed(b"\x1b[<0;80;", 80, true);
+        let r = f.feed(b"\x1b[<0;80;", HIT, true);
         assert!(r.forward.is_empty());
-        let r = f.feed(b"1M", 80, true);
+        let r = f.feed(b"1M", HIT, true);
         assert!(r.clicked);
     }
 
     #[test]
     fn f9_opens_the_picker_without_reaching_the_editor() {
         let mut f = InputFilter::default();
-        let r = f.feed(b"a\x1b[20~b", 80, false);
+        let r = f.feed(b"a\x1b[20~b", HIT, false);
         assert!(r.hotkey && !r.clicked);
         assert_eq!(r.forward, b"ab");
     }
@@ -345,7 +419,7 @@ mod tests {
     #[test]
     fn wheel_and_motion_over_the_badge_are_not_clicks() {
         let mut f = InputFilter::default();
-        let r = f.feed(b"\x1b[<64;80;1M\x1b[<35;80;1M", 80, true);
+        let r = f.feed(b"\x1b[<64;80;1M\x1b[<35;80;1M", HIT, true);
         assert!(!r.clicked);
     }
 
