@@ -5,5 +5,6 @@ categories = ["System", "TerminalEmulator", "ConsoleOnly"]
 keywords = ["terminal", "multiplexer", "session"]
 icon_names = ["tmux", "utilities-terminal"]
 simple_icon = "tmux"
+version_arg = "-V"
 [theme]
 fallback = "terminal"

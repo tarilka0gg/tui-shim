@@ -110,6 +110,27 @@ pub fn render(app: &App, exec: &str, icon: &str) -> String {
     )
 }
 
+/// Launcher line for tui-shim's own floating helper windows (class tui-shim.picker).
+pub fn helper_exec(term: Term, term_bin: &str, title: &str, pal: &Palette, cmd: &[String]) -> String {
+    let mut a: Vec<String> = vec![term_bin.into()];
+    match term {
+        Term::Ghostty => {
+            a.extend(["--class=tui-shim.picker".into(), format!("--title={title}"), "--window-width=70".into(), "--window-height=16".into()]);
+            for (k, flag) in [("bg", "background"), ("fg", "foreground")] {
+                if let Some(c) = pal.get(k) {
+                    a.push(format!("--{flag}={c}"));
+                }
+            }
+            a.push("-e".into());
+        }
+        Term::Alacritty => a.extend(["--class".into(), "tui-shim.picker".into(), "-T".into(), title.into(), "-e".into()]),
+        Term::Foot => a.extend(["--app-id=tui-shim.picker".into(), format!("--title={title}")]),
+        Term::Kitty => a.extend(["--class".into(), "tui-shim.picker".into(), "--title".into(), title.into()]),
+    }
+    a.extend(cmd.iter().cloned());
+    a.iter().map(|x| quote(x)).collect::<Vec<_>>().join(" ")
+}
+
 pub fn write(path: &Path, content: &str, dry: bool) -> Result<bool> {
     if std::fs::read_to_string(path).ok().as_deref() == Some(content) {
         return Ok(false);

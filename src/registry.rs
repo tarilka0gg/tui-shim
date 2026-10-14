@@ -20,6 +20,8 @@ pub struct App {
     pub icon_names: Vec<String>,
     pub dashboard_icon: Option<String>,
     pub simple_icon: Option<String>,
+    /// flag that prints the version (default --version)
+    pub version_arg: Option<String>,
     #[serde(default)]
     pub theme: Theme,
 }
