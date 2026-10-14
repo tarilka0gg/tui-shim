@@ -275,6 +275,8 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         cmd.pre_exec(|| {
             libc::setsid();
             libc::ioctl(0, libc::TIOCSCTTY, 0);
+            // if the wrapper dies (even by SIGKILL) the editor must not live on without a terminal
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGHUP);
             Ok(())
         });
     }
