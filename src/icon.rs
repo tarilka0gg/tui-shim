@@ -52,6 +52,12 @@ pub fn folder_icon(px: usize, bg: [u8; 3], fg: [u8; 3], ring: [u8; 3]) -> Vec<u8
     out
 }
 
+/// The badge fill with the blue channel nudged by 3: invisible to the eye, but an exact colour
+/// that a screenshot can be searched for to learn where the badge is on screen.
+pub fn marker_fill(c: [u8; 3]) -> [u8; 3] {
+    [c[0], c[1], if c[2] >= 252 { c[2] - 3 } else { c[2] + 3 }]
+}
+
 pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(data.len().div_ceil(3) * 4);

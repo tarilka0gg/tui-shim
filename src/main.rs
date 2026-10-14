@@ -7,6 +7,7 @@ mod gui;
 mod icons;
 mod palette;
 mod picker;
+mod probe;
 mod pty;
 mod track;
 mod registry;
@@ -361,6 +362,7 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
         if let (true, Some(c)) = (badge, ctl) {
             listen_ctl(c, tx);
         }
+        let sock_for_probe = sock.clone();
         let (home, name, app2) = (cx.home.clone(), app.name.clone(), app.clone());
         let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p: PathBuf| {
             if let Some(parent) = p.parent() {
@@ -378,7 +380,11 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
             }
         });
         let expand_on_start = file.is_none() && !app.builtin_picker;
-        let cfg = gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
+        let probe = match (badge, &sock_for_probe) {
+            (true, Some(sk)) => Some(gui::ProbeCfg { sock: sk.clone(), fill: icon::marker_fill(pal_rgb(th.palette(), "bg_alt", "#DAD4C1")) }),
+            _ => None,
+        };
+        let cfg = gui::OverlayCfg { probe, home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
         if badge {
             gui::panel_overlay(cfg, rx);
         } else {
@@ -484,6 +490,7 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
                 listen_ctl(ctl, tx);
             }
             let app2 = app.clone();
+            let sock_probe = sock.clone();
             let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p: PathBuf| {
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -494,7 +501,8 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
             });
             let home = cx.home.clone();
             let expand_on_start = file.is_none() && !app.builtin_picker;
-            let cfg = gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
+            let probe = badge.then(|| gui::ProbeCfg { sock: sock_probe.clone(), fill: icon::marker_fill(pal_rgb(th.palette(), "bg_alt", "#DAD4C1")) });
+            let cfg = gui::OverlayCfg { probe, home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start };
             if badge {
                 gui::panel_overlay(cfg, rx);
             } else {

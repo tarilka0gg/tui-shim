@@ -108,13 +108,14 @@ fn current_badge(fd: RawFd) -> Option<Badge> {
 }
 
 const IMG_ID: u32 = 77;
+const MARKER_ID: u32 = 78;
 
-fn upload_icon(rgba: &[u8], px: u32) {
+fn upload_icon(id: u32, rgba: &[u8], px: u32) {
     let b64 = crate::icon::base64(rgba);
     let chunks: Vec<&str> = b64.as_bytes().chunks(4096).map(|c| std::str::from_utf8(c).unwrap()).collect();
     for (i, c) in chunks.iter().enumerate() {
         let more = if i + 1 < chunks.len() { 1 } else { 0 };
-        let ctl = if i == 0 { format!("a=t,f=32,s={px},v={px},i={IMG_ID},q=2,m={more}") } else { format!("m={more}") };
+        let ctl = if i == 0 { format!("a=t,f=32,s={px},v={px},i={id},q=2,m={more}") } else { format!("m={more}") };
         write_all(1, format!("\x1b_G{ctl};{c}\x1b\\").as_bytes());
     }
 }
@@ -267,6 +268,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
     let (mut filter, mut editor_mouse) = (InputFilter::default(), false);
     let (mut dirty, mut last_out) = (deco.is_some(), Instant::now());
     let (mut alt, mut uploaded): (bool, Option<(bool, u32)>) = (false, None);
+    let (mut probe_req, mut probe_until, mut marker_uploaded): (bool, Option<Instant>, Option<(bool, u32)>) = (false, None, None);
     let mut buf = [0u8; 8192];
     'outer: loop {
         if WINCH.swap(false, Ordering::Relaxed) {
@@ -305,7 +307,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         }
         if fds[2].revents & libc::POLLIN != 0 {
             while let Ok(n) = dg.recv(&mut buf) {
-                write_all(m, &buf[..n]);
+                if &buf[..n] == crate::probe::PROBE {
+                    probe_req = true; // not for the editor: flash the marker badge
+                } else {
+                    write_all(m, &buf[..n]);
+                }
             }
         }
         if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
@@ -322,13 +328,30 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         }
         // redraw the badge only once the editor has been quiet for a moment, so it never lands
         // in the middle of one of the editor's escape sequences
+        // locate request: draw the marker badge (a fill that differs by 3 in blue) over the real one
+        if probe_req && last_out.elapsed() >= Duration::from_millis(25) {
+            probe_req = false;
+            if let (Some(d), Some(b)) = (&deco, current_badge(0)) {
+                if marker_uploaded != Some((alt, b.n)) {
+                    upload_icon(MARKER_ID, &crate::icon::folder_icon(b.n as usize, crate::icon::marker_fill(d.bg), d.fg, d.ring), b.n);
+                    marker_uploaded = Some((alt, b.n));
+                }
+                write_all(1, format!("\x1b7\x1b[{};{}H\x1b_Ga=p,i={MARKER_ID},p=2,X={},Y={},C=1,z=2000,q=2\x1b\\\x1b8", b.row, b.col, b.xo, b.yo).as_bytes());
+                let keep = std::env::var("TUI_SHIM_MARKER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500); // invisible, so no cost to keeping it up
+                probe_until = Some(Instant::now() + Duration::from_millis(keep));
+            }
+        }
+        if probe_until.is_some_and(|t| Instant::now() >= t) {
+            write_all(1, format!("\x1b_Ga=d,d=i,i={MARKER_ID},p=2,q=2\x1b\\").as_bytes());
+            probe_until = None;
+        }
         if dirty && last_out.elapsed() >= Duration::from_millis(120) {
             if let Some(d) = &deco {
                 match current_badge(0) {
                     Some(b) => {
                         if uploaded != Some((alt, b.n)) {
                             // image storage is per screen, and the size follows the font: (re)send
-                            upload_icon(&crate::icon::folder_icon(b.n as usize, d.bg, d.fg, d.ring), b.n);
+                            upload_icon(IMG_ID, &crate::icon::folder_icon(b.n as usize, d.bg, d.fg, d.ring), b.n);
                             uploaded = Some((alt, b.n));
                         }
                         draw_icon(&b);
@@ -336,7 +359,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                     None => {
                         // no pixel size known: two cells wide, one tall, in the corner
                         if uploaded != Some((alt, 0)) {
-                            upload_icon(&crate::icon::folder_icon(64, d.bg, d.fg, d.ring), 64);
+                            upload_icon(IMG_ID, &crate::icon::folder_icon(64, d.bg, d.fg, d.ring), 64);
                             uploaded = Some((alt, 0));
                         }
                         let col = cols_of(0).saturating_sub(1).max(1);

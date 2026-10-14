@@ -699,7 +699,14 @@ fn file_panel(home: PathBuf, start: PathBuf, reveal: Rc<RefCell<Option<PathBuf>>
 
 // -------------------------------------------------------------------- overlay
 
+/// How to find the badge on screen when the layout does not say (see probe.rs).
+pub struct ProbeCfg {
+    pub sock: PathBuf,
+    pub fill: [u8; 3],
+}
+
 pub struct OverlayCfg {
+    pub probe: Option<ProbeCfg>,
     pub home: PathBuf,
     pub start: PathBuf,
     pub pal: Option<Palette>,
@@ -732,7 +739,7 @@ flowboxchild { transition: background 120ms; border-radius: 10px; }
 "#;
 
 pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
-    let OverlayCfg { home, start, pal, on_pick, expand_on_start } = cfg;
+    let OverlayCfg { home, start, pal, on_pick, expand_on_start, .. } = cfg;
     let rx = Rc::new(rx);
     launch(pal, move |app| {
         let (rx, on_pick) = (rx.clone(), on_pick.clone());
@@ -927,14 +934,26 @@ pub fn usable_areas() -> Vec<(String, i32, i32)> {
     v
 }
 
+/// Where the panel goes.
+#[derive(Clone, Copy)]
+enum Place {
+    /// from the layout estimate in `geometry` (usable-area coordinates)
+    Estimate,
+    /// from the badge's measured screen position (output coordinates, logical px)
+    Probed(crate::probe::Found),
+    /// position unknown: centred near the top
+    Center,
+}
+
 /// The picker as a popup, opened by a click on the badge drawn inside the terminal.
 /// No persistent window: a small window beside the editor is created on a click and removed when
-/// it closes. It opens at once (no pointer to wait for), fades in, and resumes where you left off.
+/// it closes. It opens at once, slides in, and resumes where you left off.
 pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
-    let OverlayCfg { home, start, pal, on_pick, expand_on_start } = cfg;
+    let OverlayCfg { home, start, pal, on_pick, expand_on_start, probe } = cfg;
     let rx = Rc::new(rx);
+    let probe = Rc::new(probe);
     launch(pal, move |app| {
-        let (rx, on_pick) = (rx.clone(), on_pick.clone());
+        let (rx, on_pick, probe) = (rx.clone(), on_pick.clone(), probe.clone());
         if let Some(display) = gdk::Display::default() {
             let prov = gtk::CssProvider::new();
             prov.load_from_string(OVERLAY_CSS);
@@ -951,23 +970,14 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         let geometry: Rc<RefCell<(i32, i32, i32, bool, Option<String>)>> = Rc::new(RefCell::new((10, 10, 0, false, None)));
         let open: Rc<RefCell<Option<gtk::ApplicationWindow>>> = Rc::new(RefCell::new(None));
         let opened_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
-        // how to close the panel that is open right now (fades out, remembers the view, forgets the window)
+        let probing = Rc::new(Cell::new(false));
+        // how to close the panel that is open right now (slides away, remembers the view, forgets the window)
         let close_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
-        let toggle: Rc<dyn Fn()> = {
+        let open_with: Rc<dyn Fn(Place)> = {
             let (app, home, view, picked_file, geometry, open, on_pick, opened_at, close_slot) =
                 (app.clone(), home.clone(), view.clone(), picked_file.clone(), geometry.clone(), open.clone(), on_pick.clone(), opened_at.clone(), close_slot.clone());
-            Rc::new(move || {
-                if open.borrow().is_some() {
-                    // a second click while the panel is still appearing is the same click, not "close"
-                    if opened_at.get().elapsed() > Duration::from_millis(400) {
-                        let c = close_slot.borrow().clone();
-                        if let Some(c) = c {
-                            c();
-                        }
-                    }
-                    return;
-                }
+            Rc::new(move |place: Place| {
                 opened_at.set(Instant::now());
                 const PANEL_W: i32 = 540;
                 const INSET: i32 = 50; // from the window's top and right borders
@@ -982,17 +992,28 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 win.set_keyboard_mode(KeyboardMode::OnDemand);
                 win.set_namespace(Some("tui-shim-panel"));
                 win.set_anchor(Edge::Top, true);
-                if exact && edge_x >= PANEL_W + 100 {
-                    win.set_anchor(Edge::Right, true);
-                    win.set_margin(Edge::Right, (right - 10 + INSET - MARGIN).max(0));
-                    win.set_margin(Edge::Top, (top - 10 + INSET - MARGIN).max(0));
-                } else if exact {
-                    // narrow window near the left edge: grow rightwards instead
-                    win.set_anchor(Edge::Left, true);
-                    win.set_margin(Edge::Left, (edge_x - INSET - MARGIN - PANEL_W).max(0));
-                    win.set_margin(Edge::Top, (top - 10 + INSET - MARGIN).max(0));
-                } else {
-                    win.set_margin(Edge::Top, 80); // position unknown: centred near the top
+                match place {
+                    Place::Probed(f) => {
+                        // measured: coordinates are from the output's corner, so ignore bars and docks
+                        crate::log(&format!("probed badge: right={:.0} top={:.0}", f.right, f.top));
+                        win.set_exclusive_zone(-1);
+                        win.set_anchor(Edge::Left, true);
+                        // the badge is 10px inside the terminal grid; the panel sits 50px inside it
+                        win.set_margin(Edge::Left, (f.right.round() as i32 + 10 - INSET - MARGIN - PANEL_W).max(0));
+                        win.set_margin(Edge::Top, (f.top.round() as i32 - 10 + INSET - MARGIN).max(0));
+                    }
+                    Place::Estimate if exact && edge_x >= PANEL_W + 100 => {
+                        win.set_anchor(Edge::Right, true);
+                        win.set_margin(Edge::Right, (right - 10 + INSET - MARGIN).max(0));
+                        win.set_margin(Edge::Top, (top - 10 + INSET - MARGIN).max(0));
+                    }
+                    Place::Estimate if exact => {
+                        // narrow window near the left edge: grow rightwards instead
+                        win.set_anchor(Edge::Left, true);
+                        win.set_margin(Edge::Left, (edge_x - INSET - MARGIN - PANEL_W).max(0));
+                        win.set_margin(Edge::Top, (top - 10 + INSET - MARGIN).max(0));
+                    }
+                    _ => win.set_margin(Edge::Top, 80), // position unknown: centred near the top
                 }
                 if let Some(mon) = monitor.as_deref().and_then(monitor_by_name) {
                     win.set_monitor(Some(&mon));
@@ -1080,6 +1101,56 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 win.present();
                 rev.set_reveal_child(true);
                 glib::idle_add_local_once(move || focus());
+            })
+        };
+
+        let toggle: Rc<dyn Fn()> = {
+            let (open, opened_at, close_slot, open_with, geometry, probe, probing) = (open.clone(), opened_at.clone(), close_slot.clone(), open_with.clone(), geometry.clone(), probe.clone(), probing.clone());
+            Rc::new(move || {
+                if open.borrow().is_some() {
+                    // a second click while the panel is still appearing is the same click, not "close"
+                    if opened_at.get().elapsed() > Duration::from_millis(400) {
+                        let c = close_slot.borrow().clone();
+                        if let Some(c) = c {
+                            c();
+                        }
+                    }
+                    return;
+                }
+                if probing.get() {
+                    return; // already finding the badge for this click
+                }
+                let (_, _, _, exact, monitor) = geometry.borrow().clone();
+                if exact {
+                    open_with(Place::Estimate);
+                    return;
+                }
+                // the layout does not say where this window is (a middle column of a scrolled strip):
+                // find the badge itself on screen
+                match (&*probe, monitor) {
+                    (Some(p), Some(output)) => {
+                        probing.set(true);
+                        let (tx, result) = std::sync::mpsc::channel();
+                        let (sock, fill) = (p.sock.clone(), p.fill);
+                        std::thread::spawn(move || {
+                            let _ = tx.send(crate::probe::locate(&sock, fill, &output));
+                        });
+                        let (open_with, probing) = (open_with.clone(), probing.clone());
+                        let began = Instant::now();
+                        glib::timeout_add_local(Duration::from_millis(15), move || {
+                            let found = match result.try_recv() {
+                                Ok(f) => f,
+                                Err(std::sync::mpsc::TryRecvError::Empty) if began.elapsed() < crate::probe::timeout() => return glib::ControlFlow::Continue,
+                                Err(_) => None,
+                            };
+                            probing.set(false);
+                            crate::log(&format!("probe result: {found:?} after {:?}", began.elapsed()));
+                            open_with(found.map(Place::Probed).unwrap_or(Place::Center));
+                            glib::ControlFlow::Break
+                        });
+                    }
+                    _ => open_with(Place::Center),
+                }
             })
         };
 
