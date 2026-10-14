@@ -277,6 +277,13 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             copy_size(0, m); // the kernel signals the editor's foreground group itself
             dirty = true;
             last_winch = Some(Instant::now());
+            // move the badge in the same instant: the old placement stays on its old cell until
+            // it is replaced, which showed it at the previous spot for a moment
+            if let (Some(_), Some(b)) = (&deco, current_badge(0)) {
+                if uploaded == Some((alt, b.n)) {
+                    draw_icon(&b);
+                }
+            }
         }
         let mut fds = [
             libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
