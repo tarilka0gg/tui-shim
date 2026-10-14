@@ -178,10 +178,7 @@ pub fn prompt(title: &str, hint: &str, th: &Theme) -> Result<Option<String>> {
 
 /// File chooser shown before an editor without its own file browser starts.
 pub fn pick_file(home: &std::path::Path, start: &std::path::Path, th: &Theme) -> Result<Option<std::path::PathBuf>> {
-    #[cfg(feature = "gui")]
-    if th.gui {
-        return crate::gui::pick_file(home.to_path_buf(), start.to_path_buf(), th.pal.as_ref());
-    }
+    let _ = start;
     let Some(name) = prompt("Open file", "path, or a new file name (relative paths are under ~)", th)? else {
         return Ok(None);
     };

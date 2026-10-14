@@ -37,7 +37,6 @@ pub fn push_recent(home: &Path, file: &Path) {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
-    Up,
     Dir,
     File,
     Recent,
@@ -105,39 +104,36 @@ fn human(n: u64) -> String {
     }
 }
 
-/// What the picker shows for `dir` and the text typed so far.
-pub fn candidates(home: &Path, dir: &Path, query: &str) -> Vec<Entry> {
-    let mut out = Vec::new();
+/// Tiles for the grid: the directory (or recent files), filtered by `query`.
+/// A non-empty query also offers "create this file".
+pub fn view(home: &Path, dir: &Path, show_hidden: bool, recent_mode: bool, query: &str) -> Vec<Entry> {
     let q = query.trim();
-    if let Some(parent) = dir.parent() {
-        if q.is_empty() {
-            out.push(Entry { path: parent.to_path_buf(), label: "../".into(), detail: "up".into(), kind: Kind::Up });
-        }
-    }
+    let base: Vec<Entry> = if recent_mode {
+        recent(home)
+            .into_iter()
+            .map(|r| {
+                let label = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let detail = r.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                Entry { path: r, label, detail, kind: Kind::Recent }
+            })
+            .collect()
+    } else {
+        list_dir(dir, show_hidden || q.starts_with('.'))
+    };
     if q.is_empty() {
-        for r in recent(home).into_iter().take(6) {
-            let label = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let detail = r.parent().map(|p| p.display().to_string()).unwrap_or_default();
-            out.push(Entry { path: r, label, detail, kind: Kind::Recent });
-        }
-        out.extend(list_dir(dir, false));
-        return out;
+        return base;
     }
-    let mut scored: Vec<(i32, Entry)> = list_dir(dir, q.starts_with('.'))
-        .into_iter()
-        .filter_map(|e| fuzzy(q, &e.label).map(|s| (s, e)))
-        .collect();
-    for r in recent(home) {
-        let label = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if let Some(s) = fuzzy(q, &label) {
-            let detail = r.parent().map(|p| p.display().to_string()).unwrap_or_default();
-            scored.push((s + 5, Entry { path: r, label, detail, kind: Kind::Recent }));
-        }
-    }
+    let mut scored: Vec<(i32, Entry)> = base.into_iter().filter_map(|e| fuzzy(q, &e.label).map(|s| (s, e))).collect();
     scored.sort_by_key(|(s, _)| -s);
-    out.extend(scored.into_iter().map(|(_, e)| e));
-    let new_path = if q.starts_with('/') { PathBuf::from(q) } else if let Some(r) = q.strip_prefix("~/") { home.join(r) } else { dir.join(q) };
-    out.push(Entry { label: format!("New file: {q}"), detail: new_path.display().to_string(), path: new_path, kind: Kind::New });
+    let mut out: Vec<Entry> = scored.into_iter().map(|(_, e)| e).collect();
+    let new_path = if q.starts_with('/') {
+        PathBuf::from(q)
+    } else if let Some(r) = q.strip_prefix("~/") {
+        home.join(r)
+    } else {
+        dir.join(q)
+    };
+    out.push(Entry { label: q.to_string(), detail: new_path.display().to_string(), path: new_path, kind: Kind::New });
     out
 }
 
@@ -161,9 +157,10 @@ mod tests {
         std::fs::write(d.join(".hidden"), "x").unwrap();
         let l = list_dir(&d, false);
         assert_eq!(l.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["sub/", "alpha.txt"]);
-        let c = candidates(&d, &d, "alp");
+        let c = view(&d, &d, false, false, "alp");
         assert_eq!(c[0].label, "alpha.txt");
         assert_eq!(c.last().unwrap().kind, Kind::New);
+        assert_eq!(view(&d, &d, false, false, "").len(), 2);
     }
 
     #[test]

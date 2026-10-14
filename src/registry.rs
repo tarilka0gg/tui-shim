@@ -25,8 +25,10 @@ pub struct App {
     /// editor already has its own file picker (nvim): no picker before launch
     #[serde(default)]
     pub builtin_picker: bool,
-    /// "nvim": open files in the running instance through --listen/--server
-    pub remote: Option<String>,
+    /// bytes typed into the running editor to open a file; {file} is substituted
+    pub open_keys: Option<String>,
+    /// how {file} is quoted for the editor: "shell" (double quotes) or "vim" (backslashes)
+    pub open_quote: Option<String>,
     #[serde(default)]
     pub theme: Theme,
 }
@@ -74,5 +76,30 @@ mod tests {
                 assert!(super::TEMPLATES.get_file(p).is_some(), "missing template {p}");
             }
         }
+    }
+}
+
+impl App {
+    /// Keystrokes that make the running editor open `file`, if we know how.
+    pub fn open_keys(&self, file: &std::path::Path) -> Option<Vec<u8>> {
+        let tpl = self.open_keys.as_deref()?;
+        let f = file.to_string_lossy();
+        let quoted = match self.open_quote.as_deref() {
+            Some("vim") => f.chars().flat_map(|c| if " \\|%#\"'".contains(c) { vec!['\\', c] } else { vec![c] }).collect::<String>(),
+            _ => format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")),
+        };
+        Some(tpl.replace("{file}", &quoted).into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    #[test]
+    fn open_keys_quote() {
+        let apps = super::load().unwrap();
+        let micro = apps.iter().find(|a| a.name == "micro").unwrap();
+        assert_eq!(micro.open_keys(std::path::Path::new("/a b/c.txt")).unwrap(), b"\x05open \"/a b/c.txt\"\r");
+        let nvim = apps.iter().find(|a| a.name == "nvim").unwrap();
+        assert_eq!(nvim.open_keys(std::path::Path::new("/a b/c.txt")).unwrap(), b"\x1b:e /a\\ b/c.txt\r");
     }
 }

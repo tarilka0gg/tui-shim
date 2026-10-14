@@ -6,6 +6,7 @@ mod gui;
 mod icons;
 mod palette;
 mod picker;
+mod pty;
 mod track;
 mod registry;
 mod scan;
@@ -80,6 +81,13 @@ enum Cmd {
     Open {
         app: String,
         file: Option<PathBuf>,
+    },
+    /// (internal) run a command on a pty that `open` can type into
+    #[command(hide = true)]
+    PtyRun {
+        sock: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        argv: Vec<String>,
     },
     /// Print a niri window-rule that floats the picker windows
     NiriRule,
@@ -278,11 +286,12 @@ fn detached(argv: &[String]) -> Result<()> {
 fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf>) -> Result<()> {
     let app = apps.iter().find(|a| a.name == name).with_context(|| format!("unknown app {name}"))?;
     let found = scan::scan(apps, &cx.home).into_iter().find(|f| f.app.name == name).with_context(|| format!("{name} is not installed"))?;
-    let start = std::env::current_dir().ok().filter(|d| d.starts_with(&cx.home)).unwrap_or_else(|| cx.home.clone());
+    let overlay = cfg!(feature = "gui") && th.gui && std::env::var_os("NIRI_SOCKET").is_some();
     let file = match file {
         Some(f) => Some(f),
-        None if app.builtin_picker => None,
-        None => match picker::pick_file(&cx.home, &start, th)? {
+        // the overlay offers the picker on top of the editor; without it, ask up front
+        None if app.builtin_picker || overlay => None,
+        None => match picker::pick_file(&cx.home, &cx.home, th)? {
             Some(f) => Some(f),
             None => return Ok(()),
         },
@@ -294,14 +303,17 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
         files::push_recent(&cx.home, f);
     }
     let (term, term_bin) = desktop::detect_terminal().context("no supported terminal found")?;
-    let mut argv = desktop::launch_args(app, &found.bin, term, &term_bin, &cx.pal);
-    let sock = (app.remote.as_deref() == Some("nvim")).then(|| {
-        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        format!("{dir}/tui-shim-nvim-{}.sock", std::process::id())
-    });
-    if let Some(s) = &sock {
-        argv.extend(["--listen".into(), s.clone()]);
-    }
+    let exe = std::env::current_exe()?;
+    // editors we know how to type into run under our pty wrapper so the overlay can open files in place
+    let sock = (overlay && app.open_keys.is_some()).then(|| pty::socket_path(std::process::id()));
+    let mut argv = if sock.is_some() {
+        // launch_args ends with the program to run: make that the wrapper
+        let mut a = desktop::launch_args(app, &exe, term, &term_bin, &cx.pal);
+        a.extend(["pty-run".into(), sock.as_ref().unwrap().to_string_lossy().into_owned(), "--".into(), found.bin.to_string_lossy().into_owned()]);
+        a
+    } else {
+        desktop::launch_args(app, &found.bin, term, &term_bin, &cx.pal)
+    };
     if let Some(f) = &file {
         argv.push(f.to_string_lossy().into_owned());
     }
@@ -311,19 +323,27 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
     detached(&argv)?;
 
     #[cfg(feature = "gui")]
-    if th.gui && std::env::var_os("NIRI_SOCKET").is_some() {
+    if overlay {
         let (tx, rx) = std::sync::mpsc::channel();
         track::spawn(class, before, tx);
-        let (home, exe, app_name, bin) = (cx.home.clone(), std::env::current_exe()?, app.name.clone(), found.bin.clone());
-        let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p| {
-            let _ = match &sock {
-                // nvim: open in the running instance
-                Some(s) => detached(&[bin.to_string_lossy().into_owned(), "--server".into(), s.clone(), "--remote-tab".into(), p.to_string_lossy().into_owned()]),
-                // others have no remote protocol: a new window (with its own overlay)
-                None => detached(&[exe.to_string_lossy().into_owned(), "open".into(), app_name.clone(), p.to_string_lossy().into_owned()]),
-            };
+        let (home, name, app2) = (cx.home.clone(), app.name.clone(), app.clone());
+        let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p: PathBuf| {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match (&sock, app2.open_keys(&p)) {
+                // type the "open" command into the running editor
+                (Some(s), Some(keys)) => {
+                    let _ = pty::inject(s, &keys);
+                }
+                // no known way to drive this editor: a new window (with its own overlay)
+                _ => {
+                    let _ = detached(&[exe.to_string_lossy().into_owned(), "open".into(), name.clone(), p.to_string_lossy().into_owned()]);
+                }
+            }
         });
-        gui::overlay(gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick }, rx);
+        let expand_on_start = file.is_none() && !app.builtin_picker;
+        gui::overlay(gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start }, rx);
     }
     Ok(())
 }
@@ -406,6 +426,9 @@ fn main() -> Result<()> {
             let pal = load_pal().ok();
             let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
             run_open(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, app, file.clone())?;
+        }
+        Cmd::PtyRun { sock, argv } => {
+            std::process::exit(pty::run(sock, argv)?);
         }
         Cmd::NiriRule => {
             println!("// add to ~/.config/niri/config.kdl\nwindow-rule {{\n    match app-id=r#\"^tui-shim\\.picker$\"#\n    open-floating true\n}}");

@@ -5,6 +5,8 @@ categories = ["Utility", "TextEditor", "ConsoleOnly"]
 keywords = ["editor", "text"]
 icon_names = ["micro", "text-editor"]
 dashboard_icon = "micro"
+open_keys = "\u0005open {file}\r"
+open_quote = "shell"
 [theme]
 path = "~/.config/micro/colorschemes/tui-shim.micro"
 template = "micro.colorscheme"

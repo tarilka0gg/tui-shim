@@ -7,6 +7,7 @@ icon_names = ["nvim", "neovim"]
 dashboard_icon = "neovim"
 simple_icon = "neovim"
 builtin_picker = true
-remote = "nvim"
+open_keys = "\u001b:e {file}\r"
+open_quote = "vim"
 [theme]
 fallback = "terminal"

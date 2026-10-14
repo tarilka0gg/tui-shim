@@ -234,144 +234,347 @@ pub fn prompt(title: &str, field: &str, pal: Option<&Palette>) -> Result<Option<
 
 type PickFn = Rc<dyn Fn(PathBuf)>;
 
-fn kind_icon(k: &Kind) -> &'static str {
-    match k {
-        Kind::Up => "go-up-symbolic",
-        Kind::Dir => "folder-symbolic",
-        Kind::File => "text-x-generic-symbolic",
-        Kind::Recent => "document-open-recent-symbolic",
-        Kind::New => "document-new-symbolic",
-    }
+const COLS: i32 = 4;
+
+struct Nav {
+    dir: PathBuf,
+    back: Vec<PathBuf>,
+    fwd: Vec<PathBuf>,
+    hidden: bool,
+    recent: bool,
 }
 
-/// Path line, filter/new-name entry, result list. Shared by the standalone window and the overlay.
-/// Returns the widget, the entry (to focus) and a refresh hook (call when it becomes visible).
-fn file_panel(home: PathBuf, start: PathBuf, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, gtk::SearchEntry, Rc<dyn Fn()>) {
-    let dir = Rc::new(RefCell::new(start));
+fn tile(e: &Entry) -> gtk::Box {
+    let img = match e.kind {
+        Kind::Dir => gtk::Image::from_icon_name("folder"),
+        Kind::New => gtk::Image::from_icon_name("document-new"),
+        _ => {
+            let (ct, _) = gio::content_type_guess(Some(&e.label), None);
+            gtk::Image::from_gicon(&gio::content_type_get_icon(&ct))
+        }
+    };
+    img.set_pixel_size(48);
+    let text = if e.kind == Kind::New { format!("New: {}", e.label) } else { e.label.clone() };
+    let label = gtk::Label::builder()
+        .label(text)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .max_width_chars(12)
+        .lines(2)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .justify(gtk::Justification::Center)
+        .build();
+    let b = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(4)
+        .margin_end(4)
+        .width_request(96)
+        .tooltip_text(if e.detail.is_empty() { e.label.clone() } else { format!("{}\n{}", e.label, e.detail) })
+        .build();
+    b.append(&img);
+    b.append(&label);
+    b
+}
+
+fn flat_button(icon: &str, tip: &str) -> gtk::Button {
+    gtk::Button::builder().icon_name(icon).css_classes(["flat"]).tooltip_text(tip).build()
+}
+
+fn focus_first(w: &gtk::Widget) {
+    if let Some(fb) = w.downcast_ref::<gtk::FlowBox>() {
+        if let Some(c) = fb.child_at_index(0) {
+            c.grab_focus();
+            return;
+        }
+    }
+    w.grab_focus();
+}
+
+fn focus_in_entry(w: &impl IsA<gtk::Widget>) -> bool {
+    let mut cur = w.root().and_then(|r| r.focus());
+    while let Some(x) = cur {
+        if x.is::<gtk::Entry>() || x.is::<gtk::SearchEntry>() {
+            return true;
+        }
+        cur = x.parent();
+    }
+    false
+}
+
+/// Thunar-style file browser: nav buttons + path bar on top, search, and a grid of icon tiles.
+/// Returns the widget, the widget to focus when it becomes visible, and a refresh hook.
+fn file_panel(home: PathBuf, start: PathBuf, on_pick: PickFn, on_cancel: Rc<dyn Fn()>) -> (gtk::Box, gtk::Widget, Rc<dyn Fn()>) {
+    let nav = Rc::new(RefCell::new(Nav { dir: start, back: vec![], fwd: vec![], hidden: false, recent: false }));
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));
-    let path_label = gtk::Label::builder()
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::Start)
-        .css_classes(["dim-label", "caption"])
+
+    let back_b = flat_button("go-previous-symbolic", "Back (Alt+Left)");
+    let fwd_b = flat_button("go-next-symbolic", "Forward (Alt+Right)");
+    let up_b = flat_button("go-up-symbolic", "Up (Alt+Up)");
+    let home_b = flat_button("user-home-symbolic", "Home (Alt+Home)");
+    let recent_b = gtk::ToggleButton::builder().icon_name("document-open-recent-symbolic").css_classes(["flat"]).tooltip_text("Recent files").build();
+    let search_b = gtk::ToggleButton::builder().icon_name("system-search-symbolic").css_classes(["flat"]).tooltip_text("Filter (Ctrl+F, or just type)").build();
+    let path = gtk::Entry::builder().hexpand(true).build();
+    path.set_icon_from_icon_name(gtk::EntryIconPosition::Primary, Some("user-home-symbolic"));
+    let filter = gtk::SearchEntry::builder().placeholder_text("Filter - or type a new file name").visible(false).build();
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .homogeneous(true)
+        .min_children_per_line(COLS as u32)
+        .max_children_per_line(COLS as u32)
+        .activate_on_single_click(true)
+        .valign(gtk::Align::Start)
         .build();
-    let entry = gtk::SearchEntry::builder().placeholder_text("Filter, or type a new file name").hexpand(true).build();
-    let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Single).css_classes(["boxed-list"]).build();
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&list)
-        .vexpand(true)
-        .min_content_height(240)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
-    root.append(&path_label);
-    root.append(&entry);
+    let scroller = gtk::ScrolledWindow::builder().child(&flow).vexpand(true).min_content_height(300).hscrollbar_policy(gtk::PolicyType::Never).build();
+
+    let bar = gtk::Box::builder().spacing(2).build();
+    for b in [&back_b, &fwd_b, &up_b, &home_b] {
+        bar.append(b);
+    }
+    bar.append(&path);
+    bar.append(&recent_b);
+    bar.append(&search_b);
+    let root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).margin_top(10).margin_bottom(10).margin_start(10).margin_end(10).build();
+    root.append(&bar);
+    root.append(&filter);
     root.append(&scroller);
 
     let refresh: Rc<dyn Fn()> = {
-        let (dir, entries, list, entry, path_label) = (dir.clone(), entries.clone(), list.clone(), entry.clone(), path_label.clone());
+        let (nav, entries, flow, filter, path, back_b, fwd_b, up_b, home) = (nav.clone(), entries.clone(), flow.clone(), filter.clone(), path.clone(), back_b.clone(), fwd_b.clone(), up_b.clone(), home.clone());
         Rc::new(move || {
-            list.remove_all();
-            let d = dir.borrow().clone();
-            path_label.set_text(&d.display().to_string());
-            let found = files::candidates(&home, &d, &entry.text());
+            flow.remove_all();
+            let n = nav.borrow();
+            let found = files::view(&home, &n.dir, n.hidden, n.recent, &filter.text());
             for e in &found {
-                let row = adw::ActionRow::builder().title(&e.label).subtitle(&e.detail).use_markup(false).subtitle_lines(1).activatable(true).build();
-                row.add_prefix(&gtk::Image::from_icon_name(kind_icon(&e.kind)));
-                list.append(&row);
+                flow.append(&tile(e));
             }
             *entries.borrow_mut() = found;
-            if let Some(r) = list.row_at_index(0) {
-                list.select_row(Some(&r));
+            let mut shown = n.dir.display().to_string();
+            if !shown.ends_with('/') {
+                shown.push('/');
+            }
+            path.set_text(&shown);
+            path.remove_css_class("error");
+            back_b.set_sensitive(!n.back.is_empty());
+            fwd_b.set_sensitive(!n.fwd.is_empty());
+            up_b.set_sensitive(n.dir.parent().is_some());
+            if let Some(c) = flow.child_at_index(0) {
+                flow.select_child(&c);
+            }
+        })
+    };
+    let go: Rc<dyn Fn(PathBuf)> = {
+        let (nav, refresh, filter) = (nav.clone(), refresh.clone(), filter.clone());
+        Rc::new(move |to| {
+            if !to.is_dir() {
+                return;
+            }
+            {
+                let mut n = nav.borrow_mut();
+                let cur = n.dir.clone();
+                if cur != to {
+                    n.back.push(cur);
+                    n.fwd.clear();
+                }
+                n.dir = to;
+                n.recent = false;
+            }
+            filter.set_text("");
+            refresh();
+        })
+    };
+    let go_back: Rc<dyn Fn()> = {
+        let (nav, refresh) = (nav.clone(), refresh.clone());
+        Rc::new(move || {
+            {
+                let mut n = nav.borrow_mut();
+                let Some(prev) = n.back.pop() else { return };
+                let cur = std::mem::replace(&mut n.dir, prev);
+                n.fwd.push(cur);
+            }
+            refresh();
+        })
+    };
+    let go_fwd: Rc<dyn Fn()> = {
+        let (nav, refresh) = (nav.clone(), refresh.clone());
+        Rc::new(move || {
+            {
+                let mut n = nav.borrow_mut();
+                let Some(next) = n.fwd.pop() else { return };
+                let cur = std::mem::replace(&mut n.dir, next);
+                n.back.push(cur);
+            }
+            refresh();
+        })
+    };
+    let go_up: Rc<dyn Fn()> = {
+        let (nav, go) = (nav.clone(), go.clone());
+        Rc::new(move || {
+            let parent = nav.borrow().dir.parent().map(|p| p.to_path_buf());
+            if let Some(p) = parent {
+                go(p);
             }
         })
     };
     let activate: Rc<dyn Fn(usize)> = {
-        let (dir, entries, entry, refresh) = (dir.clone(), entries.clone(), entry.clone(), refresh.clone());
+        let (entries, go, on_pick) = (entries.clone(), go.clone(), on_pick.clone());
         Rc::new(move |i| {
             let Some(e) = entries.borrow().get(i).cloned() else { return };
             match e.kind {
-                Kind::Up | Kind::Dir => {
-                    *dir.borrow_mut() = e.path;
-                    entry.set_text("");
-                    refresh();
-                }
+                Kind::Dir => go(e.path),
                 _ => on_pick(e.path),
             }
         })
     };
-    {
-        let r = refresh.clone();
-        entry.connect_search_changed(move |_| r());
-    }
-    {
-        let (a, l) = (activate.clone(), list.clone());
-        entry.connect_activate(move |_| {
-            if let Some(row) = l.selected_row() {
-                a(row.index() as usize);
+
+    back_b.connect_clicked({
+        let g = go_back.clone();
+        move |_| g()
+    });
+    fwd_b.connect_clicked({
+        let g = go_fwd.clone();
+        move |_| g()
+    });
+    up_b.connect_clicked({
+        let g = go_up.clone();
+        move |_| g()
+    });
+    home_b.connect_clicked({
+        let (g, h) = (go.clone(), home.clone());
+        move |_| g(h.clone())
+    });
+    recent_b.connect_toggled({
+        let (nav, refresh) = (nav.clone(), refresh.clone());
+        move |b| {
+            nav.borrow_mut().recent = b.is_active();
+            refresh();
+        }
+    });
+    search_b.connect_toggled({
+        let (filter, flow) = (filter.clone(), flow.clone());
+        move |b| {
+            filter.set_visible(b.is_active());
+            if b.is_active() {
+                filter.grab_focus();
+            } else {
+                filter.set_text("");
+                if let Some(c) = flow.child_at_index(0) {
+                    c.grab_focus();
+                }
             }
-        });
-    }
-    {
+        }
+    });
+    filter.connect_search_changed({
+        let r = refresh.clone();
+        move |_| r()
+    });
+    filter.connect_activate({
+        let (a, flow) = (activate.clone(), flow.clone());
+        move |_| a(flow.selected_children().first().map(|c| c.index() as usize).unwrap_or(0))
+    });
+    path.connect_changed(|p| p.remove_css_class("error"));
+    path.connect_activate({
+        let (home, nav, go, on_pick) = (home.clone(), nav.clone(), go.clone(), on_pick.clone());
+        move |p| {
+            let t = p.text().trim().to_string();
+            let target = if let Some(r) = t.strip_prefix("~/") {
+                home.join(r)
+            } else if t == "~" {
+                home.clone()
+            } else if t.starts_with('/') {
+                PathBuf::from(&t)
+            } else {
+                nav.borrow().dir.join(&t)
+            };
+            if target.is_dir() {
+                go(target);
+            } else if target.parent().is_some_and(|d| d.is_dir()) {
+                on_pick(target);
+            } else {
+                p.add_css_class("error");
+            }
+        }
+    });
+    flow.connect_child_activated({
         let a = activate.clone();
-        list.connect_row_activated(move |_, row| a(row.index() as usize));
-    }
+        move |_, c| a(c.index() as usize)
+    });
+
+    // keyboard: Thunar-like shortcuts, arrows from the filter box, type-to-filter from the grid
     let kc = gtk::EventControllerKey::new();
     kc.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
-        let (list, scroller) = (list.clone(), scroller.clone());
-        kc.connect_key_pressed(move |_, key, _, _| {
-            let step: i32 = match key {
-                gdk::Key::Down => 1,
-                gdk::Key::Up => -1,
-                gdk::Key::Escape => {
-                    on_cancel();
-                    return glib::Propagation::Stop;
+        let (root2, flow, scroller, filter, search_b, path, nav, refresh, entries) =
+            (root.clone(), flow.clone(), scroller.clone(), filter.clone(), search_b.clone(), path.clone(), nav.clone(), refresh.clone(), entries.clone());
+        let (g_back, g_fwd, g_up, g_home) = (go_back.clone(), go_fwd.clone(), go_up.clone(), { let (g, h) = (go.clone(), home.clone()); Rc::new(move || g(h.clone())) });
+        kc.connect_key_pressed(move |_, key, _, state| {
+            let alt = state.contains(gdk::ModifierType::ALT_MASK);
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let in_entry = focus_in_entry(&root2);
+            let select_by = |delta: i32| {
+                let cur = flow.selected_children().first().map(|c| c.index()).unwrap_or(-1);
+                let n = entries.borrow().len() as i32;
+                if n == 0 {
+                    return;
                 }
-                _ => return glib::Propagation::Proceed,
+                if let Some(c) = flow.child_at_index((cur + delta).clamp(0, n - 1)) {
+                    flow.select_child(&c);
+                    if let Some(b) = c.compute_bounds(&flow) {
+                        let adj = scroller.vadjustment();
+                        let (top, bottom) = (b.y() as f64, (b.y() + b.height()) as f64);
+                        if top < adj.value() {
+                            adj.set_value(top);
+                        } else if bottom > adj.value() + adj.page_size() {
+                            adj.set_value(bottom - adj.page_size());
+                        }
+                    }
+                }
             };
-            let cur = list.selected_row().map(|r| r.index()).unwrap_or(-1);
-            if let Some(row) = list.row_at_index((cur + step).max(0)) {
-                list.select_row(Some(&row));
-                if let Some(b) = row.compute_bounds(&list) {
-                    scroller.vadjustment().set_value((b.y() - 60.0) as f64);
+            match key {
+                gdk::Key::Escape => {
+                    if filter.is_visible() {
+                        search_b.set_active(false);
+                    } else {
+                        on_cancel();
+                    }
+                }
+                gdk::Key::Left if alt => g_back(),
+                gdk::Key::Right if alt => g_fwd(),
+                gdk::Key::Up if alt => g_up(),
+                gdk::Key::Home if alt => g_home(),
+                gdk::Key::l | gdk::Key::L if ctrl => {
+                    path.grab_focus();
+                    path.select_region(0, -1);
+                }
+                gdk::Key::f | gdk::Key::F if ctrl => search_b.set_active(true),
+                gdk::Key::h | gdk::Key::H if ctrl => {
+                    let h = nav.borrow().hidden;
+                    nav.borrow_mut().hidden = !h;
+                    refresh();
+                }
+                gdk::Key::Down if in_entry => select_by(COLS),
+                gdk::Key::Up if in_entry => select_by(-COLS),
+                _ => {
+                    // typing while the grid has focus starts a filter
+                    if !in_entry && !ctrl && !alt {
+                        if let Some(c) = key.to_unicode().filter(|c| !c.is_control() && *c != ' ') {
+                            search_b.set_active(true);
+                            filter.set_text(&c.to_string());
+                            filter.set_position(-1);
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    return glib::Propagation::Proceed;
                 }
             }
             glib::Propagation::Stop
         });
     }
     root.add_controller(kc);
-    (root, entry, refresh)
-}
-
-/// Standalone floating picker (used before an editor with no file browser starts).
-pub fn pick_file(home: PathBuf, start: PathBuf, pal: Option<&Palette>) -> Result<Option<PathBuf>> {
-    let result: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
-    let res = result.clone();
-    launch(pal.cloned(), move |app| {
-        let win: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
-        let (w1, r1) = (win.clone(), res.clone());
-        let on_pick: PickFn = Rc::new(move |p| {
-            *r1.borrow_mut() = Some(p);
-            if let Some(w) = w1.borrow().as_ref() {
-                w.close();
-            }
-        });
-        let w2 = win.clone();
-        let on_cancel: Rc<dyn Fn()> = Rc::new(move || {
-            if let Some(w) = w2.borrow().as_ref() {
-                w.close();
-            }
-        });
-        let (panel, entry, refresh) = file_panel(home.clone(), start.clone(), on_pick, on_cancel);
-        let window = window(app, "Open file", &panel);
-        *win.borrow_mut() = Some(window.clone());
-        refresh();
-        window.present();
-        float_self();
-        entry.grab_focus();
-    });
-    let out = result.borrow().clone();
-    Ok(out)
+    let focus: gtk::Widget = flow.clone().upcast();
+    (root, focus, refresh)
 }
 
 // -------------------------------------------------------------------- overlay
@@ -381,6 +584,8 @@ pub struct OverlayCfg {
     pub start: PathBuf,
     pub pal: Option<Palette>,
     pub on_pick: PickFn,
+    /// open the panel as soon as the overlay first shows (editors with no file to start from)
+    pub expand_on_start: bool,
 }
 
 fn monitor_by_name(name: &str) -> Option<gdk::Monitor> {
@@ -391,13 +596,13 @@ fn monitor_by_name(name: &str) -> Option<gdk::Monitor> {
 /// Folder button pinned (via layer-shell) to the top-right of the tracked editor window.
 /// It expands into the file panel in place and goes away with the window.
 pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
-    let OverlayCfg { home, start, pal, on_pick } = cfg;
+    let OverlayCfg { home, start, pal, on_pick, expand_on_start } = cfg;
     let rx = Rc::new(rx);
     launch(pal, move |app| {
         let (rx, on_pick, start) = (rx.clone(), on_pick.clone(), start.clone());
         if let Some(display) = gdk::Display::default() {
             let prov = gtk::CssProvider::new();
-            prov.load_from_string("window.tui-overlay { background: transparent; box-shadow: none; } .tui-panel { background: @window_bg_color; border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.35); }");
+            prov.load_from_string("window.tui-overlay { background: transparent; box-shadow: none; } .tui-panel { background: @window_bg_color; color: @window_fg_color; border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.35); } .tui-panel label, .tui-panel entry, .tui-panel text, .tui-panel button { color: @window_fg_color; }");
             gtk::style_context_add_provider_for_display(&display, &prov, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
         }
         let win = gtk::ApplicationWindow::builder().application(app).decorated(false).resizable(false).css_classes(["tui-overlay"]).build();
@@ -425,23 +630,22 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
             files::push_recent(&h, &p);
             on_pick(p);
         });
-        let (panel, entry, refresh) = file_panel(home.clone(), start, picked, collapse.clone());
+        let (panel, focus, refresh) = file_panel(home.clone(), start, picked, collapse.clone());
         panel.add_css_class("tui-panel");
-        panel.set_width_request(460);
+        panel.set_width_request(540);
         panel.set_visible(false);
         *panel_slot.borrow_mut() = Some(panel.clone());
 
         let toggle = gtk::Button::builder().icon_name("folder-open-symbolic").css_classes(["circular", "osd"]).halign(gtk::Align::End).tooltip_text("Open a file").build();
         {
-            let (panel, entry, refresh, t) = (panel.clone(), entry.clone(), refresh.clone(), touched.clone());
+            let (panel, focus, refresh, t) = (panel.clone(), focus.clone(), refresh.clone(), touched.clone());
             toggle.connect_clicked(move |_| {
                 t.set(Instant::now());
                 let show = !panel.is_visible();
                 panel.set_visible(show);
                 if show {
-                    entry.set_text("");
                     refresh();
-                    entry.grab_focus();
+                    focus_first(&focus);
                 }
             });
         }
@@ -451,7 +655,7 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         win.set_child(Some(&root));
 
         // debugging aid: open the panel as soon as the overlay first shows
-        let auto_expand = Cell::new(std::env::var_os("TUI_SHIM_OVERLAY_EXPANDED").is_some());
+        let auto_expand = Cell::new(expand_on_start || std::env::var_os("TUI_SHIM_OVERLAY_EXPANDED").is_some());
         let toggle2 = toggle.clone();
         let (w, app2, t) = (win.clone(), app.clone(), touched.clone());
         glib::timeout_add_local(Duration::from_millis(80), move || {
