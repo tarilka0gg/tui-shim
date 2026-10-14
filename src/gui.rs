@@ -866,7 +866,7 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                             toggle2.emit_clicked();
                         }
                     }
-                    Msg::Click | Msg::Hotkey => {}
+                    Msg::Click(_) | Msg::Hotkey(_) => {}
                     Msg::Hide => {
                         if want_hidden.get().is_none() {
                             want_hidden.set(Some(Instant::now()));
@@ -971,14 +971,17 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         let open: Rc<RefCell<Option<gtk::ApplicationWindow>>> = Rc::new(RefCell::new(None));
         let opened_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
         let probing = Rc::new(Cell::new(false));
+        // when the badge was last clicked (or F9 pressed): a click on the terminal also takes the keyboard
+        // focus from the panel, which must not be mistaken for "the user went elsewhere"
+        let last_badge = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
         // how to close the panel that is open right now (slides away, remembers the view, forgets the window)
         let close_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
         let open_with: Rc<dyn Fn(Place)> = {
-            let (app, home, view, picked_file, geometry, open, on_pick, opened_at, close_slot) =
-                (app.clone(), home.clone(), view.clone(), picked_file.clone(), geometry.clone(), open.clone(), on_pick.clone(), opened_at.clone(), close_slot.clone());
+            let (app, home, view, picked_file, geometry, open, on_pick, opened_at, close_slot, last_badge) =
+                (app.clone(), home.clone(), view.clone(), picked_file.clone(), geometry.clone(), open.clone(), on_pick.clone(), opened_at.clone(), close_slot.clone(), last_badge.clone());
             Rc::new(move |place: Place| {
-                opened_at.set(Instant::now());
+                let _ = &opened_at;
                 const PANEL_W: i32 = 540;
                 const INSET: i32 = 50; // from the window's top and right borders
                 const MARGIN: i32 = 10; // the panel's own margin: its visible edge is this far inside
@@ -1027,6 +1030,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                         if open.borrow().is_none() {
                             return;
                         }
+                        crate::log("closing the panel");
                         // remember the folder and scroll position for the next time
                         let snap = snap_slot.borrow().clone();
                         if let Some(snap) = snap {
@@ -1081,16 +1085,31 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     });
                 }
                 {
-                    // keyboard focus left the panel (the user went to another window): close it
-                    let (close, w) = (close.clone(), win.clone());
+                    // keyboard focus left the panel: the user went to another window, so close it, unless
+                    // it was the badge click itself (a second click lands on the terminal and takes the focus)
+                    let (close, w, last_badge, open) = (close.clone(), win.clone(), last_badge.clone(), open.clone());
                     let seen = Cell::new(false);
                     win.connect_is_active_notify(move |win| {
+                        crate::log(&format!("panel is_active={}", win.is_active()));
                         if win.is_active() {
                             seen.set(true);
                         } else if seen.get() {
-                            let (close, w) = (close.clone(), w.clone());
+                            let (close, w, last_badge, open) = (close.clone(), w.clone(), last_badge.clone(), open.clone());
                             glib::timeout_add_local_once(Duration::from_millis(120), move || {
-                                if !w.is_active() {
+                                if w.is_active() {
+                                    return;
+                                }
+                                if last_badge.get().elapsed() < Duration::from_millis(900) && open.borrow().as_ref() == Some(&w) {
+                                    crate::log("focus lost right after a badge click: keeping the panel and taking the focus back");
+                                    w.set_keyboard_mode(KeyboardMode::Exclusive); // grabs focus at once
+                                    let (w, open) = (w.clone(), open.clone());
+                                    glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                                        if open.borrow().as_ref() == Some(&w) {
+                                            w.set_keyboard_mode(KeyboardMode::OnDemand); // clicks elsewhere work normally again
+                                        }
+                                    });
+                                } else {
+                                    crate::log("focus lost -> closing the panel");
                                     close();
                                 }
                             });
@@ -1100,16 +1119,22 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 refresh();
                 win.present();
                 rev.set_reveal_child(true);
+                crate::log("panel presented");
                 glib::idle_add_local_once(move || focus());
             })
         };
 
-        let toggle: Rc<dyn Fn()> = {
-            let (open, opened_at, close_slot, open_with, geometry, probe, probing) = (open.clone(), opened_at.clone(), close_slot.clone(), open_with.clone(), geometry.clone(), probe.clone(), probing.clone());
-            Rc::new(move || {
+        let toggle: Rc<dyn Fn(Instant)> = {
+            let (open, opened_at, close_slot, open_with, geometry, probe, probing, last_badge) = (open.clone(), opened_at.clone(), close_slot.clone(), open_with.clone(), geometry.clone(), probe.clone(), probing.clone(), last_badge.clone());
+            Rc::new(move |at: Instant| {
+                // `at` is when the click arrived: building the panel can take a while, and a double
+                // click's second half is queued meanwhile, so compare arrival times, not handling times
+                last_badge.set(at);
                 if open.borrow().is_some() {
-                    // a second click while the panel is still appearing is the same click, not "close"
-                    if opened_at.get().elapsed() > Duration::from_millis(400) {
+                    let since = at.saturating_duration_since(opened_at.get());
+                    crate::log(&format!("badge event while open (arrived {since:?} after the click that opened it)"));
+                    // a second click right after the first is the same double click, not "close"
+                    if since > Duration::from_millis(500) {
                         let c = close_slot.borrow().clone();
                         if let Some(c) = c {
                             c();
@@ -1120,6 +1145,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 if probing.get() {
                     return; // already finding the badge for this click
                 }
+                opened_at.set(at); // the click that opens it
                 let (_, _, _, exact, monitor) = geometry.borrow().clone();
                 if exact {
                     open_with(Place::Estimate);
@@ -1162,10 +1188,10 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     Msg::Show { right, top, edge_x, exact, monitor } => {
                         *geometry.borrow_mut() = (right, top, edge_x, exact, monitor);
                         if !started.replace(true) {
-                            toggle(); // an editor with no file yet: offer the picker right away
+                            toggle(Instant::now()); // an editor with no file yet: offer the picker right away
                         }
                     }
-                    Msg::Click | Msg::Hotkey => toggle(),
+                    Msg::Click(at) | Msg::Hotkey(at) => toggle(at),
                     Msg::Hide => {}
                     Msg::Quit => {
                         app2.quit();

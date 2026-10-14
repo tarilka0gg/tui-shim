@@ -433,7 +433,8 @@ fn listen_ctl(path: PathBuf, tx: std::sync::mpsc::Sender<track::Msg>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 64];
         while let Ok(n) = sock.recv(&mut buf) {
-            let msg = if &buf[..n] == b"key" { track::Msg::Hotkey } else { track::Msg::Click };
+            let at = std::time::Instant::now(); // when it arrived, not when it gets handled
+            let msg = if &buf[..n] == b"key" { track::Msg::Hotkey(at) } else { track::Msg::Click(at) };
             log(&format!("ctl: {msg:?}"));
             if tx.send(msg).is_err() {
                 break;
