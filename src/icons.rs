@@ -118,7 +118,13 @@ pub fn glyph(app: &App, pal: &Palette) -> String {
 /// Resolve the Icon= value for an app, installing/caching as needed.
 pub fn resolve(app: &App, home: &Path, pal: &Palette, dry: bool, offline: bool) -> Result<String> {
     if let Some(p) = find_installed(home, &app.icon_names) {
-        return Ok(p.to_string_lossy().into_owned());
+        // An icon from a theme goes by its name: launchers that recolour icons (Noctalia does) treat a file path as a flat picture and
+        // turn a coloured one into a black square, but resolve a name through the theme the way they do for every other program.
+        let themed = !p.starts_with("/usr/share/pixmaps");
+        return Ok(match p.file_stem() {
+            Some(stem) if themed => stem.to_string_lossy().into_owned(),
+            _ => p.to_string_lossy().into_owned(),
+        });
     }
     let id = format!("tui-shim-{}", app.name);
     let svg_dst = home.join(format!(".local/share/icons/hicolor/scalable/apps/{id}.svg"));
