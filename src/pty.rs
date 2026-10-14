@@ -73,7 +73,7 @@ pub struct Badge {
     pub hit: (u32, u32, u32, u32),
 }
 
-/// Badge about 1.6 cells tall, one cell (about 20px) away from the top and right edges of the
+/// Badge about 1.6 cells tall, half a cell (about 10px) away from the top and right edges of the
 /// terminal grid. None when the terminal does not report pixel sizes.
 pub fn badge_geometry(cols: u16, rows: u16, xpix: u16, ypix: u16) -> Option<Badge> {
     if cols == 0 || rows == 0 || xpix == 0 || ypix == 0 {
@@ -81,7 +81,7 @@ pub fn badge_geometry(cols: u16, rows: u16, xpix: u16, ypix: u16) -> Option<Badg
     }
     let (cw, ch) = (xpix as f64 / cols as f64, ypix as f64 / rows as f64);
     let n = (ch * 1.6).round();
-    let gap = ch.round();
+    let gap = (ch * 0.5).round();
     let (x, y) = (xpix as f64 - gap - n, gap);
     let (col0, row0) = ((x / cw).floor(), (y / ch).floor());
     let (xo, yo) = ((x - col0 * cw).round().min(cw.floor() - 1.0).max(0.0), (y - row0 * ch).round().min(ch.floor() - 1.0).max(0.0));
@@ -367,14 +367,14 @@ mod tests {
     const HIT: (u32, u32, u32, u32) = (79, 80, 1, 2);
 
     #[test]
-    fn badge_geometry_keeps_a_cell_sized_gap_to_the_top_and_right() {
+    fn badge_geometry_keeps_a_half_cell_gap_to_the_top_and_right() {
         // 80x24 cells of 10x20 px
         let b = badge_geometry(80, 24, 800, 480).unwrap();
         assert_eq!(b.n, 32); // 1.6 cells tall
         let (x, y) = ((b.col - 1) * 10 + b.xo, (b.row - 1) * 20 + b.yo);
-        assert_eq!(800 - (x + b.n), 20, "20px from the right edge");
-        assert_eq!(y, 20, "20px from the top edge");
-        assert!(b.hit.0 <= b.col && b.hit.1 >= 80 - 2 && b.hit.2 == 2);
+        assert_eq!(800 - (x + b.n), 10, "10px from the right edge");
+        assert_eq!(y, 10, "10px from the top edge");
+        assert!(b.hit.0 <= b.col && b.hit.1 >= 80 - 2 && b.hit.2 == 1);
         assert!(badge_geometry(80, 24, 0, 0).is_none());
     }
 
