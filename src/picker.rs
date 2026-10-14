@@ -10,6 +10,9 @@ use crossterm::{
 use std::io::{self, Write};
 
 pub struct Theme {
+    /// show the libadwaita window instead of the terminal UI
+    pub gui: bool,
+    pal: Option<Palette>,
     bg: Color,
     fg: Color,
     accent: Color,
@@ -24,16 +27,19 @@ fn hex(p: &Palette, k: &str) -> Color {
 }
 
 impl Theme {
-    pub fn from_palette(p: Option<&Palette>) -> Self {
+    pub fn from_palette(p: Option<&Palette>, gui: bool) -> Self {
+        let pal = p.cloned();
         match p {
             Some(p) => Self {
+                gui,
+                pal,
                 bg: hex(p, "bg"),
                 fg: hex(p, "fg"),
                 accent: hex(p, "accent"),
                 sel: hex(p, "khaki"),
                 dim: hex(p, "fg_dim"),
             },
-            None => Self { bg: Color::Reset, fg: Color::Reset, accent: Color::Red, sel: Color::DarkGrey, dim: Color::Grey },
+            None => Self { gui, pal, bg: Color::Reset, fg: Color::Reset, accent: Color::Red, sel: Color::DarkGrey, dim: Color::Grey },
         }
     }
 }
@@ -41,6 +47,7 @@ impl Theme {
 pub struct Item {
     pub label: String,
     pub detail: String,
+    pub icon: Option<std::path::PathBuf>,
 }
 
 struct Guard;
@@ -82,6 +89,10 @@ pub fn pick(title: &str, hint: &str, items: &[Item], start: usize, th: &Theme) -
     if items.is_empty() {
         return Ok(None);
     }
+    #[cfg(feature = "gui")]
+    if th.gui {
+        return crate::gui::pick(title, items, start, th.pal.as_ref());
+    }
     let _g = Guard::new()?;
     let mut out = io::stdout();
     let mut sel = start.min(items.len() - 1);
@@ -120,6 +131,10 @@ pub fn pick(title: &str, hint: &str, items: &[Item], start: usize, th: &Theme) -
 
 /// One-line text prompt. None when cancelled.
 pub fn prompt(title: &str, hint: &str, th: &Theme) -> Result<Option<String>> {
+    #[cfg(feature = "gui")]
+    if th.gui {
+        return crate::gui::prompt(title, "File name (relative paths are under ~)", th.pal.as_ref());
+    }
     let _g = Guard::new()?;
     let mut out = io::stdout();
     let mut buf = String::new();

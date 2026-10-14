@@ -44,7 +44,11 @@ pub fn detect_terminal() -> Option<(Term, String)> {
 }
 
 /// Quote one argument per the Desktop Entry spec.
-fn quote(a: &str) -> String {
+pub fn quote(a: &str) -> String {
+    // field codes (%f %F %u %U ...) must reach the launcher unescaped
+    if matches!(a, "%f" | "%F" | "%u" | "%U") {
+        return a.to_string();
+    }
     let a = a.replace('%', "%%");
     if a.chars().any(|c| " \t\n\"'\\><~|&;$*?#()`,=".contains(c)) {
         let esc = a.replace('\\', "\\\\").replace('"', "\\\"").replace('`', "\\`").replace('$', "\\$");
@@ -55,6 +59,11 @@ fn quote(a: &str) -> String {
 }
 
 pub fn exec_line(app: &App, bin: &Path, term: Term, term_bin: &str, pal: &Palette) -> String {
+    launch_args(app, bin, term, term_bin, pal).iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// argv that opens `bin` in a terminal window of class tui-shim.<app>, with recolor/env fallbacks.
+pub fn launch_args(app: &App, bin: &Path, term: Term, term_bin: &str, pal: &Palette) -> Vec<String> {
     let class = format!("tui-shim.{}", app.name);
     let mut args: Vec<String> = vec![term_bin.to_string()];
     let recolor = app.theme.fallback.as_deref() == Some("terminal");
@@ -97,7 +106,12 @@ pub fn exec_line(app: &App, bin: &Path, term: Term, term_bin: &str, pal: &Palett
         }
     }
     args.push(bin.to_string_lossy().into_owned());
-    args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+    args
+}
+
+/// Exec line for a GUI helper: this binary itself, no terminal window.
+pub fn direct_exec(cmd: &[String]) -> String {
+    cmd.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
 }
 
 pub fn render(app: &App, exec: &str, icon: &str) -> String {
@@ -153,5 +167,6 @@ mod tests {
         assert_eq!(quote("btop"), "btop");
         assert_eq!(quote("A=b;c"), "\"A=b;c\"");
         assert_eq!(quote("100%"), "100%%");
+        assert_eq!(quote("%f"), "%f");
     }
 }

@@ -1,5 +1,7 @@
 mod choices;
 mod desktop;
+#[cfg(feature = "gui")]
+mod gui;
 mod icons;
 mod palette;
 mod picker;
@@ -13,6 +15,7 @@ use clap::{Parser, Subcommand};
 use palette::Palette;
 use picker::{Item, Theme};
 use registry::App;
+use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
@@ -28,6 +31,9 @@ struct Cli {
     /// Never use the network (icons fall back to generated glyphs)
     #[arg(long, global = true)]
     offline: bool,
+    /// Force the terminal picker even when a display is available
+    #[arg(long, global = true)]
+    tui: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -99,7 +105,17 @@ fn sync_one(cx: &Ctx, f: &scan::Found, term: desktop::Term, term_bin: &str, no_t
 fn write_helpers(cx: &Ctx, term: desktop::Term, term_bin: &str) -> Result<()> {
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
     let dir = desktop::apps_dir(&cx.home);
-    let choose = desktop::helper_exec(term, term_bin, "Choose TUI versions", &cx.pal, &[exe.clone(), "choose".into()]);
+    // With the GUI feature the helpers are plain windows; otherwise they run in a terminal.
+    let helper = |title: &str, args: &[&str]| -> String {
+        let mut cmd = vec![exe.clone()];
+        cmd.extend(args.iter().map(|a| a.to_string()));
+        if cfg!(feature = "gui") {
+            desktop::direct_exec(&cmd)
+        } else {
+            desktop::helper_exec(term, term_bin, title, &cx.pal, &cmd)
+        }
+    };
+    let choose = helper("Choose TUI versions", &["choose"]);
     desktop::write(
         &dir.join("tui-shim-choose.desktop"),
         &format!(
@@ -109,8 +125,8 @@ fn write_helpers(cx: &Ctx, term: desktop::Term, term_bin: &str) -> Result<()> {
         ),
         cx.dry,
     )?;
-    let edit = desktop::helper_exec(term, term_bin, "Open with", &cx.pal, &[exe.clone(), "edit".into(), "%f".into()]);
-    let new = desktop::helper_exec(term, term_bin, "New file", &cx.pal, &[exe, "edit".into(), "--new".into()]);
+    let edit = helper("Open with", &["edit", "%f"]);
+    let new = helper("New file", &["edit", "--new"]);
     desktop::write(
         &dir.join("tui-shim-edit.desktop"),
         &format!(
@@ -140,8 +156,9 @@ fn run_choose(cx: &Ctx, th: &Theme, apps: &[App], only: &Option<String>) -> Resu
         let items: Vec<Item> = vs
             .iter()
             .map(|v| Item {
-                label: format!("{:<6} {}", v.origin, v.path.display()),
-                detail: scan::version(&v.path, arg),
+                label: a.title.clone(),
+                detail: format!("{} - {} - {}", v.origin, v.path.display(), scan::version(&v.path, arg)),
+                icon: icons::find_installed(&cx.home, &a.icon_names),
             })
             .collect();
         let cur = ch.bin.get(&a.name).and_then(|c| vs.iter().position(|v| v.path.to_str() == Some(c.as_str())));
@@ -175,10 +192,14 @@ fn run_edit(cx: &Ctx, th: &Theme, apps: &[App], file: &Option<PathBuf>, new: boo
     } else {
         let items: Vec<Item> = editors
             .iter()
-            .map(|f| Item { label: f.app.title.clone(), detail: f.bin.display().to_string() })
+            .map(|f| Item {
+                label: f.app.title.clone(),
+                detail: f.bin.display().to_string(),
+                icon: icons::find_installed(&cx.home, &f.app.icon_names),
+            })
             .collect();
         let title = match file {
-            Some(f) if !new => format!("Open {} with", f.display()),
+            Some(f) if !new => format!("Open {} with", f.file_name().unwrap_or_default().to_string_lossy()),
             _ => "New file with".to_string(),
         };
         match picker::pick(&title, "up/down or 1-9 select - enter confirm - esc cancel", &items, last, th)? {
@@ -203,8 +224,27 @@ fn run_edit(cx: &Ctx, th: &Theme, apps: &[App], file: &Option<PathBuf>, new: boo
             p
         }
     };
-    let err = std::process::Command::new(&editors[pick].bin).arg(&target).exec();
-    bail!("cannot start {}: {err}", editors[pick].bin.display())
+    if std::io::stdin().is_terminal() {
+        // already inside a terminal: become the editor
+        let err = std::process::Command::new(&editors[pick].bin).arg(&target).exec();
+        bail!("cannot start {}: {err}", editors[pick].bin.display());
+    }
+    // started from a launcher / the GUI picker: the editor needs a terminal window
+    let (term, term_bin) = desktop::detect_terminal().context("no supported terminal found")?;
+    let f = &editors[pick];
+    let mut argv = desktop::launch_args(f.app, &f.bin, term, &term_bin, &cx.pal);
+    argv.push(target.to_string_lossy().into_owned());
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // SAFETY: setsid only; lets the terminal outlive this process.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().with_context(|| format!("cannot start {term_bin}"))?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -213,6 +253,9 @@ fn main() -> Result<()> {
     let pal_path = cli.palette.clone().unwrap_or_else(|| home.join(".config/futuro-darko/palette.md"));
     let apps = registry::load()?;
     let dry = cli.dry_run;
+    let use_gui = cfg!(feature = "gui")
+        && !cli.tui
+        && (std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some());
     let load_pal = || Palette::from_markdown(&pal_path);
     let ctx = || -> Result<Ctx> { Ok(Ctx { home: home.clone(), pal: load_pal()?, dry, offline: cli.offline }) };
 
@@ -264,7 +307,7 @@ fn main() -> Result<()> {
         Cmd::Choose { app } => {
             let pal = load_pal().ok();
             let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
-            let th = Theme::from_palette(pal.as_ref());
+            let th = Theme::from_palette(pal.as_ref(), use_gui);
             let changed = run_choose(&cx, &th, &apps, app)?;
             if !changed.is_empty() && pal.is_some() {
                 let (term, term_bin) = desktop::detect_terminal().context("no supported terminal found")?;
@@ -276,7 +319,7 @@ fn main() -> Result<()> {
         Cmd::Edit { file, new } => {
             let pal = load_pal().ok();
             let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
-            run_edit(&cx, &Theme::from_palette(pal.as_ref()), &apps, file, *new)?;
+            run_edit(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, file, *new)?;
         }
         Cmd::NiriRule => {
             println!("// add to ~/.config/niri/config.kdl\nwindow-rule {{\n    match app-id=r#\"^tui-shim\\.picker$\"#\n    open-floating true\n}}");
