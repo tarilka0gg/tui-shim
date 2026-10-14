@@ -251,6 +251,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
                 let f = filter.feed(&buf[..n as usize], cols_of(0), editor_mouse);
                 write_all(m, &f.forward);
                 if f.clicked || f.hotkey {
+                    crate::log(&format!("wrapper: badge {} (cols={})", if f.clicked { "click" } else { "F9" }, cols_of(0)));
                     let _ = ctl.send_to(if f.clicked { b"click" } else { b"key" }, &deco.as_ref().unwrap().ctl);
                 }
             } else {

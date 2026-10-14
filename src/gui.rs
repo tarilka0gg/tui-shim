@@ -942,12 +942,19 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
 
         // `at_pointer`: opened by a mouse click on the badge, so the pointer marks where the badge is
         let toggle_slot: Rc<RefCell<Option<Rc<dyn Fn(bool)>>>> = Rc::new(RefCell::new(None));
+        let opened_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(60)));
         let toggle: Rc<dyn Fn(bool)> = {
-            let (app, home, start, reveal, geometry, open, on_pick, toggle_slot) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone(), toggle_slot.clone());
+            let (app, home, start, reveal, geometry, open, on_pick, toggle_slot, opened_at) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone(), toggle_slot.clone(), opened_at.clone());
             Rc::new(move |at_pointer: bool| {
                 if let Some(w) = open.borrow().as_ref() {
-                    w.close();
+                    // a second click while the panel is still appearing is the same click, not "close"
+                    if opened_at.get().elapsed() > Duration::from_millis(900) {
+                        w.close();
+                    }
                     return;
+                }
+                if at_pointer || opened_at.get().elapsed() > Duration::from_millis(900) {
+                    opened_at.set(Instant::now());
                 }
                 // a transparent full-screen surface holds the panel: it can read the pointer position
                 // (the compositor will not tell us where a tiled window is) and catches click-away
@@ -964,6 +971,7 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 win.set_namespace(Some("tui-shim-panel"));
                 let (right, top, _edge_x, exact, monitor) = geometry.borrow().clone();
                 let screen = screen_size(monitor.as_deref());
+                crate::log(&format!("open panel: at_pointer={at_pointer} exact={exact} right={right} top={top} monitor={monitor:?} screen={screen:?}"));
                 if let Some(mon) = monitor.as_deref().and_then(monitor_by_name) {
                     win.set_monitor(Some(&mon));
                 }
@@ -1054,10 +1062,14 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                         match pointer.get() {
                             // pointer sits on the badge, which is about 29px in from the window's right
                             // edge and 24px down from its top edge
-                            Some((px, py)) => place(px + 29.0 - INSET - MARGIN - PANEL_W, py - 24.0 + INSET - MARGIN),
-                            None if began.elapsed() < Duration::from_millis(800) => return glib::ControlFlow::Continue,
+                            Some((px, py)) => {
+                                crate::log(&format!("pointer at ({px:.0},{py:.0}) -> panel placed from the pointer"));
+                                place(px + 29.0 - INSET - MARGIN - PANEL_W, py - 24.0 + INSET - MARGIN)
+                            }
+                            None if began.elapsed() < Duration::from_millis(150) => return glib::ControlFlow::Continue,
                             None => {
                                 // the compositor never reported the pointer: use the layout estimate instead
+                                crate::log("no pointer event within 150ms -> using the layout estimate");
                                 open2.borrow_mut().take();
                                 win2.close();
                                 *reveal2.borrow_mut() = remembered.clone();

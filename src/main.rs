@@ -388,6 +388,21 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
     Ok(())
 }
 
+/// Append one line to ~/.cache/tui-shim/overlay.log (kept small). For diagnosing the overlay.
+pub fn log(line: &str) {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = PathBuf::from(home).join(".cache/tui-shim/overlay.log");
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 200_000) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() % 100000).unwrap_or(0);
+        let _ = writeln!(f, "[{t}] pid={} {line}", std::process::id());
+    }
+}
+
 fn pal_rgb(pal: Option<&Palette>, key: &str, default: &str) -> [u8; 3] {
     icon::parse_hex(pal.and_then(|p| p.get(key)).unwrap_or(default)).unwrap_or([128, 128, 128])
 }
@@ -413,6 +428,7 @@ fn listen_ctl(path: PathBuf, tx: std::sync::mpsc::Sender<track::Msg>) {
         let mut buf = [0u8; 64];
         while let Ok(n) = sock.recv(&mut buf) {
             let msg = if &buf[..n] == b"key" { track::Msg::Hotkey } else { track::Msg::Click };
+            log(&format!("ctl: {msg:?}"));
             if tx.send(msg).is_err() {
                 break;
             }
@@ -451,6 +467,7 @@ fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option
             let ctl = sock.with_extension("ctl");
             // terminals that draw images get the button inside the window, always at its corner
             let badge = terminal_draws_images();
+            log(&format!("terminal mode: badge={badge} TERM_PROGRAM={:?} TERM={:?} window={id}", std::env::var("TERM_PROGRAM").ok(), std::env::var("TERM").ok()));
             let deco = badge.then(|| {
                 let pal = th.palette();
                 pty::Deco { rgba: icon::folder_icon(64, pal_rgb(pal, "bg_alt", "#DAD4C1"), pal_rgb(pal, "fg", "#3B342B"), pal_rgb(pal, "secondary", "#7D8278")), px: 64, ctl: ctl.clone() }
