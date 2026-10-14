@@ -1,4 +1,4 @@
-//! Native libadwaita pickers (3:4 portrait window). Compiled with the `gui` feature.
+//! Native libadwaita pickers (4:3 landscape window, 640x480). Compiled with the `gui` feature.
 use crate::palette::Palette;
 use crate::picker::Item;
 use anyhow::Result;
@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 /// Same app-id as the terminal helper window, so one niri window-rule matches both.
 const APP_ID: &str = "tui-shim.picker";
-const WIDTH: i32 = 480;
-const HEIGHT: i32 = 640;
+const WIDTH: i32 = 640;
+const HEIGHT: i32 = 480;
 
 fn css(p: &Palette) -> String {
     let c = |k: &str, d: &str| p.get(k).unwrap_or(d).to_string();
@@ -58,37 +58,49 @@ fn window(app: &adw::Application, title: &str, content: &impl IsA<gtk::Widget>) 
         .build()
 }
 
-/// Float, size (3:4) and centre our own window through niri IPC, so no window-rule is needed.
-/// Silently does nothing outside niri. The window maps a moment after present(), so poll for it.
-fn float_self() {
+fn niri(args: &[&str]) -> Option<std::process::Output> {
     use std::process::{Command, Stdio};
+    Command::new("niri").arg("msg").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).output().ok()
+}
+
+fn place(id: &str, float: bool) {
+    if float {
+        niri(&["action", "move-window-to-floating", "--id", id]);
+    }
+    niri(&["action", "set-window-width", "--id", id, &WIDTH.to_string()]);
+    niri(&["action", "set-window-height", "--id", id, &HEIGHT.to_string()]);
+    niri(&["action", "center-window", "--id", id]);
+}
+
+/// Float, size (4:3) and centre our own window through niri IPC, so no window-rule is needed.
+/// Silently does nothing outside niri. Runs on its own thread: the window must keep answering
+/// the compositor's resize requests while we wait for niri, or the new size never lands.
+/// Keeps checking and re-applying until niri reports the target state.
+fn float_self() {
     use std::time::Duration;
     if std::env::var_os("NIRI_SOCKET").is_none() {
         return;
     }
     let pid = std::process::id() as u64;
-    let niri = |args: &[&str]| {
-        Command::new("niri").arg("msg").args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).output().ok()
-    };
-    let mut tries = 0;
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        tries += 1;
-        let id = niri(&["-j", "windows"])
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-            .and_then(|v| {
-                v.as_array()?.iter().find(|w| w["pid"].as_u64() == Some(pid) && w["app_id"] == APP_ID)?["id"].as_u64()
-            });
-        match id {
-            Some(id) => {
-                let id = id.to_string();
-                niri(&["action", "move-window-to-floating", "--id", &id]);
-                niri(&["action", "set-window-width", "--id", &id, &WIDTH.to_string()]);
-                niri(&["action", "set-window-height", "--id", &id, &HEIGHT.to_string()]);
-                niri(&["action", "center-window", "--id", &id]);
-                glib::ControlFlow::Break
+    std::thread::spawn(move || {
+        let mut placed = 0;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(300));
+            let win = niri(&["-j", "windows"])
+                .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+                .and_then(|v| v.as_array()?.iter().find(|w| w["pid"].as_u64() == Some(pid) && w["app_id"] == APP_ID).cloned());
+            let Some(w) = win else { continue };
+            let id = w["id"].as_u64().unwrap_or(0).to_string();
+            let floating = w["is_floating"].as_bool().unwrap_or(false);
+            let size = &w["layout"]["window_size"];
+            if floating && size[0].as_i64() == Some(WIDTH as i64) && size[1].as_i64() == Some(HEIGHT as i64) {
+                niri(&["action", "center-window", "--id", &id]); // size is final now
+                return;
             }
-            None if tries > 30 => glib::ControlFlow::Break,
-            None => glib::ControlFlow::Continue,
+            if placed < 12 {
+                placed += 1;
+                place(&id, !floating);
+            }
         }
     });
 }
