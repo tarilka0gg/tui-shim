@@ -37,6 +37,10 @@ pub fn variants(name: &str, home: &Path) -> Vec<Variant> {
     for d in dirs {
         let Ok(real) = d.canonicalize() else { continue };
         let p = real.join(name);
+        // a shim is a symlink to tui-shim itself; never offer it as a copy of the editor
+        if std::fs::canonicalize(&p).ok().is_some_and(|c| std::env::current_exe().ok().and_then(|e| e.canonicalize().ok()) == Some(c)) {
+            continue;
+        }
         if is_exec(&p) && seen.insert(p.clone()) {
             let origin = if p.starts_with(home) { Origin::User } else { Origin::System };
             out.push(Variant { path: p, origin });

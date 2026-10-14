@@ -82,6 +82,11 @@ enum Cmd {
         app: String,
         file: Option<PathBuf>,
     },
+    /// Make plain `micro` / `nvim` in a terminal go through tui-shim (folder overlay in the same window)
+    Shims {
+        #[arg(value_enum, default_value = "status")]
+        action: ShimAction,
+    },
     /// (internal) run a command on a pty that `open` can type into
     #[command(hide = true)]
     PtyRun {
@@ -95,6 +100,13 @@ enum Cmd {
     Clean,
     /// Check the environment
     Doctor,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ShimAction {
+    Install,
+    Remove,
+    Status,
 }
 
 struct Ctx {
@@ -302,6 +314,10 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
         }
         files::push_recent(&cx.home, f);
     }
+    // started from a terminal: run in that terminal instead of opening another window
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return run_here(cx, th, app, &found.bin, file, overlay);
+    }
     let (term, term_bin) = desktop::detect_terminal().context("no supported terminal found")?;
     let exe = std::env::current_exe()?;
     // editors we know how to type into run under our pty wrapper so the overlay can open files in place
@@ -348,7 +364,120 @@ fn run_open(cx: &Ctx, th: &Theme, apps: &[App], name: &str, file: Option<PathBuf
     Ok(())
 }
 
+/// Run the editor in the current terminal. With the overlay available it runs on our pty
+/// (so the overlay can open files in place) and the overlay attaches to this terminal's window.
+fn run_here(cx: &Ctx, th: &Theme, app: &App, bin: &std::path::Path, file: Option<PathBuf>, overlay: bool) -> Result<()> {
+    let mut argv = vec![bin.to_string_lossy().into_owned()];
+    if let Some(f) = &file {
+        argv.push(f.to_string_lossy().into_owned());
+    }
+    #[cfg(feature = "gui")]
+    if overlay && app.open_keys.is_some() {
+        if let Some(id) = track::own_window_id() {
+            let sock = pty::socket_path(std::process::id());
+            let (sock2, argv2) = (sock.clone(), argv.clone());
+            let editor = std::thread::spawn(move || {
+                let code = pty::run(&sock2, &argv2).unwrap_or(1);
+                std::process::exit(code); // editor exited: take the overlay down with it
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            track::follow_window(id, tx);
+            let app2 = app.clone();
+            let on_pick: std::rc::Rc<dyn Fn(PathBuf)> = std::rc::Rc::new(move |p: PathBuf| {
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Some(keys) = app2.open_keys(&p) {
+                    let _ = pty::inject(&sock, &keys);
+                }
+            });
+            let home = cx.home.clone();
+            let expand_on_start = file.is_none() && !app.builtin_picker;
+            gui::overlay(gui::OverlayCfg { home: home.clone(), start: home, pal: th.palette().cloned(), on_pick, expand_on_start }, rx);
+            let _ = editor.join();
+            return Ok(());
+        }
+    }
+    let _ = (cx, th, app, overlay);
+    let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+    bail!("cannot start {}: {err}", argv[0])
+}
+
+/// Invoked through a shim symlink (`~/.local/bin/micro` -> tui-shim): behave like `open micro`
+/// for plain interactive use, and hand everything else (flags, several files, pipes) to the real editor.
+fn run_shim(name: &str) -> Result<()> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME unset")?);
+    let apps = registry::load()?;
+    let app = apps.iter().find(|a| a.name == name && a.categories.iter().any(|c| c == "TextEditor")).with_context(|| format!("{name}: not a known editor"))?;
+    let real = scan::scan(&apps, &home).into_iter().find(|f| f.app.name == name).with_context(|| format!("real {name} not found"))?.bin;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let plain = args.len() <= 1 && args.iter().all(|a| !a.to_string_lossy().starts_with('-'));
+    if !interactive || !plain {
+        let err = std::process::Command::new(&real).args(&args).exec();
+        bail!("cannot start {}: {err}", real.display());
+    }
+    let pal_path = home.join(".config/futuro-darko/palette.md");
+    let pal = Palette::from_markdown(&pal_path).ok();
+    let use_gui = cfg!(feature = "gui") && (std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some());
+    let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry: false, offline: true };
+    let file = args.first().map(PathBuf::from);
+    let _ = app;
+    run_open(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, name, file)
+}
+
+fn run_shims(home: &std::path::Path, apps: &[App], action: ShimAction) -> Result<()> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let dir = home.join(".local/bin");
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let pos = |d: &std::path::Path| path_dirs.iter().position(|p| p.canonicalize().ok() == d.canonicalize().ok());
+    for a in apps.iter().filter(|a| a.categories.iter().any(|c| c == "TextEditor")) {
+        let link = dir.join(&a.name);
+        let ours = std::fs::canonicalize(&link).ok().as_ref() == Some(&exe);
+        match action {
+            ShimAction::Status => {
+                let real = scan::variants(&a.name, home).first().map(|v| v.path.display().to_string()).unwrap_or_else(|| "not installed".into());
+                println!("{:<8} shim={:<5} real={real}", a.name, ours);
+            }
+            ShimAction::Install => {
+                if scan::variants(&a.name, home).is_empty() {
+                    println!("{}: not installed, skipped", a.name);
+                } else if ours {
+                    println!("{}: shim already in place", a.name);
+                } else if link.symlink_metadata().is_ok() {
+                    println!("{}: {} exists and is not ours, left alone", a.name, link.display());
+                } else {
+                    std::fs::create_dir_all(&dir)?;
+                    std::os::unix::fs::symlink(&exe, &link)?;
+                    println!("{}: {} -> {}", a.name, link.display(), exe.display());
+                }
+            }
+            ShimAction::Remove => {
+                if ours {
+                    std::fs::remove_file(&link)?;
+                    println!("{}: removed {}", a.name, link.display());
+                }
+            }
+        }
+    }
+    if matches!(action, ShimAction::Install) {
+        let real_pos = apps.iter().filter(|a| a.name == "micro").filter_map(|a| scan::variants(&a.name, home).first().and_then(|v| v.path.parent().and_then(|d| pos(d)))).next();
+        match (pos(&dir), real_pos) {
+            (Some(s), Some(r)) if s >= r => println!("note: {} comes after the real editors in $PATH, so the shims will not take effect until it comes first", dir.display()),
+            (None, _) => println!("note: {} is not in $PATH", dir.display()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    // called through a shim symlink (e.g. ~/.local/bin/micro)?
+    if let Some(name) = std::env::args_os().next().and_then(|a| PathBuf::from(a).file_name().map(|n| n.to_string_lossy().into_owned())) {
+        if !name.starts_with("tui-shim") {
+            return run_shim(&name);
+        }
+    }
     let cli = Cli::parse();
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unset")?);
     let pal_path = cli.palette.clone().unwrap_or_else(|| home.join(".config/futuro-darko/palette.md"));
@@ -427,6 +556,7 @@ fn main() -> Result<()> {
             let cx = Ctx { home: home.clone(), pal: pal.clone().unwrap_or_else(|| Palette { name: "none".into(), colors: Default::default() }), dry, offline: cli.offline };
             run_open(&cx, &Theme::from_palette(pal.as_ref(), use_gui), &apps, app, file.clone())?;
         }
+        Cmd::Shims { action } => run_shims(&home, &apps, *action)?,
         Cmd::PtyRun { sock, argv } => {
             std::process::exit(pty::run(sock, argv)?);
         }
