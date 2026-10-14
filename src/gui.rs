@@ -701,6 +701,12 @@ fn monitor_by_name(name: &str) -> Option<gdk::Monitor> {
     (0..mons.n_items()).filter_map(|i| mons.item(i)?.downcast::<gdk::Monitor>().ok()).find(|m| m.connector().as_deref() == Some(name))
 }
 
+/// Logical size of the monitor `name` (or the first one): the full-screen surface is that size.
+fn screen_size(name: Option<&str>) -> (f64, f64) {
+    let mon = name.and_then(monitor_by_name).or_else(|| gdk::Display::default()?.monitors().item(0)?.downcast::<gdk::Monitor>().ok());
+    mon.map(|m| (m.geometry().width() as f64, m.geometry().height() as f64)).unwrap_or((1280.0, 800.0))
+}
+
 /// Folder button pinned (via layer-shell) to the top-right of the tracked editor window.
 /// It expands into the file panel in place and goes away with the window.
 const OVERLAY_CSS: &str = r#"
@@ -847,7 +853,7 @@ pub fn overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                             toggle2.emit_clicked();
                         }
                     }
-                    Msg::Click => {}
+                    Msg::Click | Msg::Hotkey => {}
                     Msg::Hide => {
                         if want_hidden.get().is_none() {
                             want_hidden.set(Some(Instant::now()));
@@ -934,32 +940,27 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
         let geometry: Rc<RefCell<(i32, i32, i32, bool, Option<String>)>> = Rc::new(RefCell::new((10, 10, 0, false, None)));
         let open: Rc<RefCell<Option<gtk::ApplicationWindow>>> = Rc::new(RefCell::new(None));
 
-        let toggle: Rc<dyn Fn()> = {
+        // `at_pointer`: opened by a mouse click on the badge, so the pointer marks where the badge is
+        let toggle: Rc<dyn Fn(bool)> = {
             let (app, home, start, reveal, geometry, open, on_pick) = (app.clone(), home.clone(), start.clone(), reveal.clone(), geometry.clone(), open.clone(), on_pick.clone());
-            Rc::new(move || {
+            Rc::new(move |at_pointer: bool| {
                 if let Some(w) = open.borrow().as_ref() {
                     w.close();
                     return;
                 }
+                // a transparent full-screen surface holds the panel: it can read the pointer position
+                // (the compositor will not tell us where a tiled window is) and catches click-away
                 let win = gtk::ApplicationWindow::builder().application(&app).decorated(false).resizable(false).css_classes(["tui-overlay"]).build();
                 win.init_layer_shell();
                 win.set_layer(Layer::Overlay);
+                for e in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+                    win.set_anchor(e, true);
+                }
+                win.set_exclusive_zone(-1);
                 win.set_keyboard_mode(KeyboardMode::OnDemand);
                 win.set_namespace(Some("tui-shim-panel"));
-                let (right, top, edge_x, exact, monitor) = geometry.borrow().clone();
-                win.set_anchor(Edge::Top, true);
-                let y = (top - 10).max(0) + 30; // just under the badge row
-                if exact && edge_x >= 440 {
-                    win.set_anchor(Edge::Right, true);
-                    win.set_margin(Edge::Right, (right - 10).max(0));
-                    win.set_margin(Edge::Top, y);
-                } else if exact {
-                    win.set_anchor(Edge::Left, true);
-                    win.set_margin(Edge::Left, (edge_x - 440).max(0));
-                    win.set_margin(Edge::Top, y);
-                } else {
-                    win.set_margin(Edge::Top, 80); // position unknown: centred near the top
-                }
+                let (right, top, _edge_x, exact, monitor) = geometry.borrow().clone();
+                let screen = screen_size(monitor.as_deref());
                 if let Some(mon) = monitor.as_deref().and_then(monitor_by_name) {
                     win.set_monitor(Some(&mon));
                 }
@@ -987,27 +988,65 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                 });
                 let (panel, focus, refresh) = file_panel(home.clone(), start.clone(), reveal.clone(), picked, close.clone());
                 panel.add_css_class("tui-panel");
-                panel.set_width_request(540);
-                let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).transition_duration(220).child(&panel).build();
+                const PANEL_W: f64 = 540.0;
+                panel.set_width_request(PANEL_W as i32);
+                let rev = gtk::Revealer::builder().transition_type(gtk::RevealerTransitionType::SlideDown).transition_duration(220).child(&panel).visible(false).build();
                 *rev_slot.borrow_mut() = Some(rev.clone());
-                win.set_child(Some(&rev));
+                let fixed = gtk::Fixed::new();
+                fixed.put(&rev, 0.0, 0.0);
+                win.set_child(Some(&fixed));
                 *open.borrow_mut() = Some(win.clone());
-                // clicking elsewhere closes it
-                let seen_active = Cell::new(false);
+
+                // pointer position inside the full-screen surface = output coordinates
+                let pointer: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+                // debugging aid: pretend the pointer is at x,y (the nested test session has no pointer)
+                if let Some((x, y)) = std::env::var("TUI_SHIM_FAKE_POINTER").ok().and_then(|v| v.split_once(',').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))) {
+                    pointer.set(Some((x, y)));
+                }
+                let motion = gtk::EventControllerMotion::new();
                 {
-                    let close = close.clone();
-                    win.connect_is_active_notify(move |w| {
-                        if w.is_active() {
-                            seen_active.set(true);
-                        } else if seen_active.get() {
+                    let p = pointer.clone();
+                    motion.connect_enter(move |_, x, y| p.set(Some((x, y))));
+                }
+                {
+                    let p = pointer.clone();
+                    motion.connect_motion(move |_, x, y| {
+                        if p.get().is_none() {
+                            p.set(Some((x, y)));
+                        }
+                    });
+                }
+                win.add_controller(motion);
+                // a click outside the panel closes it
+                let away = gtk::GestureClick::new();
+                away.set_propagation_phase(gtk::PropagationPhase::Capture);
+                {
+                    let (rev, fixed, close) = (rev.clone(), fixed.clone(), close.clone());
+                    away.connect_pressed(move |_, _, x, y| {
+                        let inside = rev.compute_bounds(&fixed).is_some_and(|b| b.contains_point(&gtk::graphene::Point::new(x as f32, y as f32)));
+                        if !inside {
                             close();
                         }
                     });
                 }
+                fixed.add_controller(away);
+
                 refresh();
                 win.present();
-                glib::timeout_add_local_once(Duration::from_millis(30), move || {
-                    rev.set_reveal_child(true);
+                // place the panel once the surface has its size and the pointer has been seen
+                let (win2, fixed2, rev2) = (win.clone(), fixed.clone(), rev.clone());
+                glib::timeout_add_local_once(Duration::from_millis(if at_pointer { 160 } else { 60 }), move || {
+                    let _ = &win2;
+                    let (sw, sh) = screen;
+                    let (x, y) = match (at_pointer, pointer.get(), exact) {
+                        // under the badge, right edges aligned
+                        (true, Some((px, py)), _) => (px - PANEL_W + 36.0, py + 26.0),
+                        (_, _, true) => (sw - (right - 10).max(0) as f64 - PANEL_W, (top - 10).max(0) as f64 + 30.0),
+                        _ => ((sw - PANEL_W) / 2.0, 80.0),
+                    };
+                    fixed2.move_(&rev2, x.clamp(8.0, (sw - PANEL_W - 8.0).max(8.0)), y.clamp(8.0, (sh - 440.0).max(8.0)));
+                    rev2.set_visible(true);
+                    rev2.set_reveal_child(true);
                     focus();
                 });
             })
@@ -1020,10 +1059,11 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                     Msg::Show { right, top, edge_x, exact, monitor } => {
                         *geometry.borrow_mut() = (right, top, edge_x, exact, monitor);
                         if !started.replace(true) {
-                            toggle(); // an editor with no file yet: offer the picker right away
+                            toggle(false); // an editor with no file yet: offer the picker right away
                         }
                     }
-                    Msg::Click => toggle(),
+                    Msg::Click => toggle(true),
+                    Msg::Hotkey => toggle(false),
                     Msg::Hide => {}
                     Msg::Quit => {
                         app2.quit();

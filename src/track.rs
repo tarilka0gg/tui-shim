@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 pub enum Msg {
     /// margins are from the monitor's top-right corner, in logical pixels
     Show { right: i32, top: i32, /** x of the window's right edge; 0 when unknown */ edge_x: i32, /** position worked out, not a corner fallback */ exact: bool, monitor: Option<String> },
-    /// the in-terminal badge was clicked
+    /// the in-terminal badge was clicked (the pointer is on it)
     Click,
+    /// F9 was pressed in the editor's terminal
+    Hotkey,
     Hide,
     Quit,
 }

@@ -92,7 +92,10 @@ pub struct InputFilter {
 
 pub struct Filtered {
     pub forward: Vec<u8>,
+    /// the badge was clicked with the mouse (the pointer is on it)
     pub clicked: bool,
+    /// F9 was pressed
+    pub hotkey: bool,
 }
 
 impl InputFilter {
@@ -101,12 +104,12 @@ impl InputFilter {
     pub fn feed(&mut self, data: &[u8], cols: u16, editor_mouse: bool) -> Filtered {
         let mut buf = std::mem::take(&mut self.carry);
         buf.extend_from_slice(data);
-        let (mut forward, mut clicked) = (Vec::with_capacity(buf.len()), false);
+        let (mut forward, mut clicked, mut hotkey) = (Vec::with_capacity(buf.len()), false, false);
         let mut i = 0;
         while i < buf.len() {
             // F9 opens the picker too, for editors that do not use the mouse
             if buf[i..].starts_with(b"\x1b[20~") {
-                clicked = true;
+                hotkey = true;
                 i += 5;
                 continue;
             }
@@ -139,7 +142,7 @@ impl InputFilter {
             }
             i = j + 1;
         }
-        Filtered { forward, clicked }
+        Filtered { forward, clicked, hotkey }
     }
 }
 
@@ -247,8 +250,8 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             if deco.is_some() {
                 let f = filter.feed(&buf[..n as usize], cols_of(0), editor_mouse);
                 write_all(m, &f.forward);
-                if f.clicked {
-                    let _ = ctl.send_to(b"click", &deco.as_ref().unwrap().ctl);
+                if f.clicked || f.hotkey {
+                    let _ = ctl.send_to(if f.clicked { b"click" } else { b"key" }, &deco.as_ref().unwrap().ctl);
                 }
             } else {
                 write_all(m, &buf[..n as usize]);
@@ -334,7 +337,7 @@ mod tests {
     fn f9_opens_the_picker_without_reaching_the_editor() {
         let mut f = InputFilter::default();
         let r = f.feed(b"a\x1b[20~b", 80, false);
-        assert!(r.clicked);
+        assert!(r.hotkey && !r.clicked);
         assert_eq!(r.forward, b"ab");
     }
 

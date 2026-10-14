@@ -411,8 +411,9 @@ fn listen_ctl(path: PathBuf, tx: std::sync::mpsc::Sender<track::Msg>) {
     let Ok(sock) = std::os::unix::net::UnixDatagram::bind(&path) else { return };
     std::thread::spawn(move || {
         let mut buf = [0u8; 64];
-        while sock.recv(&mut buf).is_ok() {
-            if tx.send(track::Msg::Click).is_err() {
+        while let Ok(n) = sock.recv(&mut buf) {
+            let msg = if &buf[..n] == b"key" { track::Msg::Hotkey } else { track::Msg::Click };
+            if tx.send(msg).is_err() {
                 break;
             }
         }
