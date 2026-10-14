@@ -20,17 +20,23 @@ fn in_round_rect(u: f32, v: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> 
     (u - cx).hypot(v - cy) <= r
 }
 
-/// `px` x `px` straight-alpha RGBA. `bg` fills the badge, `ring` outlines it, `fg` is the folder.
-pub fn folder_icon(px: usize, bg: [u8; 3], fg: [u8; 3], ring: [u8; 3]) -> Vec<u8> {
+/// `w` x `h` straight-alpha RGBA. `bg` fills the badge, `ring` outlines it, `fg` is the folder.
+/// The badge is a circle as long as the image is displayed at its own aspect ratio (the caller
+/// picks `w`:`h` to match the block of terminal cells it will cover).
+/// `top` transparent pixels are left above the circle (it is as wide as the image).
+pub fn folder_icon(w: usize, h: usize, top: usize, bg: [u8; 3], fg: [u8; 3], ring: [u8; 3]) -> Vec<u8> {
     const SS: usize = 3;
-    let mut out = Vec::with_capacity(px * px * 4);
-    for y in 0..px {
-        for x in 0..px {
+    let s = w as f32; // the circle's diameter in image pixels
+    let cy = top as f32 + s / 2.0; // its centre row
+    let mut out = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
             let mut acc = [0.0f32; 4];
             for sy in 0..SS {
                 for sx in 0..SS {
-                    let u = (x as f32 + (sx as f32 + 0.5) / SS as f32) / px as f32;
-                    let v = (y as f32 + (sy as f32 + 0.5) / SS as f32) / px as f32;
+                    // unit coordinates centred on the image, scaled by the shorter side
+                    let u = ((x as f32 + (sx as f32 + 0.5) / SS as f32) - w as f32 / 2.0) / s + 0.5;
+                    let v = ((y as f32 + (sy as f32 + 0.5) / SS as f32) - cy) / s + 0.5;
                     let d = (u - 0.5).hypot(v - 0.5);
                     let body = in_round_rect(u, v, 0.26, 0.40, 0.74, 0.70, 0.04);
                     let tab = in_round_rect(u, v, 0.26, 0.31, 0.47, 0.44, 0.03);
@@ -95,12 +101,13 @@ mod tests {
 
     #[test]
     fn icon_has_round_transparent_corners_and_opaque_centre() {
-        let px = 32;
-        let img = folder_icon(px, [200, 200, 200], [30, 30, 30], [100, 100, 100]);
-        assert_eq!(img.len(), px * px * 4);
+        let (w, h) = (32, 48);
+        let img = folder_icon(w, h, 6, [200, 200, 200], [30, 30, 30], [100, 100, 100]);
+        assert_eq!(img.len(), w * h * 4);
         assert_eq!(img[3], 0, "corner pixel must be transparent");
-        let mid = (px / 2 * px + px / 2) * 4;
+        let mid = ((6 + w / 2) * w + w / 2) * 4;
         assert_eq!(img[mid + 3], 255, "centre pixel must be opaque");
+        assert_eq!(img[(3 * w + w / 2) * 4 + 3], 0, "the margin above the circle is transparent");
     }
 
     #[test]

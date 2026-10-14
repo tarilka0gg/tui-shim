@@ -20,6 +20,8 @@ pub const PROBE: &[u8] = b"\0tui-shim-probe\0";
 pub struct Found {
     pub right: f64,
     pub top: f64,
+    /// diameter of the badge circle
+    pub size: f64,
 }
 
 /// Parse a binary PPM (P6) header; returns (width, height, offset of the pixel data).
@@ -135,9 +137,8 @@ pub fn locate(sock: &Path, fill: [u8; 3], output: &str) -> Option<Found> {
         std::thread::sleep(Duration::from_millis(250));
     }
     let (l, t, r, _b) = marker?;
-    let _ = l;
     // the marker covers the badge's fill; the 2px ring around it is part of the badge
-    Some(Found { right: (r as f64 + 3.0) / scale, top: (t as f64 - 2.0) / scale })
+    Some(Found { right: (r as f64 + 3.0) / scale, top: (t as f64 - 2.0) / scale, size: ((r - l) as f64 + 5.0) / scale })
 }
 
 #[cfg(test)]

@@ -1001,9 +1001,9 @@ pub fn panel_overlay(cfg: OverlayCfg, rx: Receiver<Msg>) {
                         crate::log(&format!("probed badge: right={:.0} top={:.0}", f.right, f.top));
                         win.set_exclusive_zone(-1);
                         win.set_anchor(Edge::Left, true);
-                        // the badge is 10px inside the terminal grid; the panel sits 50px inside it
-                        win.set_margin(Edge::Left, (f.right.round() as i32 + 10 - INSET - MARGIN - PANEL_W).max(0));
-                        win.set_margin(Edge::Top, (f.top.round() as i32 - 10 + INSET - MARGIN).max(0));
+                        // the badge sits in the grid's corner cells; the panel is placed 50px inside the grid
+                        win.set_margin(Edge::Left, (f.right.round() as i32 - INSET - MARGIN - PANEL_W).max(0));
+                        win.set_margin(Edge::Top, ((f.top - 0.16 * f.size).round() as i32 + INSET - MARGIN).max(0));
                     }
                     Place::Estimate if exact && edge_x >= PANEL_W + 100 => {
                         win.set_anchor(Edge::Right, true);

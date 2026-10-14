@@ -59,35 +59,55 @@ pub struct Deco {
     pub ctl: PathBuf,
 }
 
-/// Where the badge sits, in the terminal's cells and pixels.
+/// Where the badge sits, measured in terminal cells. Sizes in pixels are not used: ghostty reports
+/// them multiplied by the display scale (on a 1.25 screen the numbers are 1.25 squared too large),
+/// while images are drawn in real pixels, so mixing the two put the click zone in the wrong place.
+/// A block of whole cells is the same on every display, and the picture is scaled to cover it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Badge {
-    /// image edge in pixels
-    pub n: u32,
-    /// 1-based cell holding the image's top-left corner, and the pixel offset inside that cell
+    /// the block of cells it covers: columns `col..col+cols`, rows `1..=rows` (1-based)
     pub col: u32,
-    pub row: u32,
-    pub xo: u32,
-    pub yo: u32,
-    /// inclusive 1-based cell rectangle a click counts on
-    pub hit: (u32, u32, u32, u32),
+    pub cols: u32,
+    pub rows: u32,
+    /// size of the picture to generate: same aspect as the block, so the circle stays round
+    pub img_w: u32,
+    pub img_h: u32,
+    /// transparent pixels above the circle inside the picture
+    pub img_top: u32,
 }
 
-/// Badge about 1.6 cells tall, half a cell (about 10px) away from the top and right edges of the
-/// terminal grid. None when the terminal does not report pixel sizes.
-pub fn badge_geometry(cols: u16, rows: u16, xpix: u16, ypix: u16) -> Option<Badge> {
-    if cols == 0 || rows == 0 || xpix == 0 || ypix == 0 {
-        return None;
+impl Badge {
+    /// inclusive 1-based cell rectangle a click counts on: (col0, col1, row0, row1)
+    pub fn hit(&self) -> (u32, u32, u32, u32) {
+        (self.col, self.col + self.cols - 1, 1, self.rows)
     }
-    let (cw, ch) = (xpix as f64 / cols as f64, ypix as f64 / rows as f64);
-    let n = (ch * 1.6).round();
-    let gap = (ch * 0.5).round();
-    let (x, y) = (xpix as f64 - gap - n, gap);
-    let (col0, row0) = ((x / cw).floor(), (y / ch).floor());
-    let (xo, yo) = ((x - col0 * cw).round().min(cw.floor() - 1.0).max(0.0), (y - row0 * ch).round().min(ch.floor() - 1.0).max(0.0));
-    let c1 = ((x + n - 1.0) / cw).floor() + 1.0;
-    let r1 = ((y + n - 1.0) / ch).floor() + 1.0;
-    Some(Badge { n: n as u32, col: col0 as u32 + 1, row: row0 as u32 + 1, xo: xo as u32, yo: yo as u32, hit: (col0 as u32 + 1, c1 as u32, row0 as u32 + 1, r1 as u32) })
+}
+
+const BADGE_COLS: u32 = 4;
+const BADGE_ROWS: u32 = 3; // two rows of circle plus room for the margin above it
+/// How far the circle sits below the grid's top edge, in rows. The window's right side carries the padding
+/// plus the leftover sliver of the grid (about half a cell on average); this brings the top gap to match.
+const TOP_MARGIN_ROWS: f64 = 0.3;
+
+/// A badge in the top-right corner: 4 columns wide, its circle a third of a row below the top.
+/// The cell's height:width ratio comes from the reported sizes (the scale cancels out in a ratio);
+/// without them cells are assumed twice as tall as wide.
+pub fn badge_geometry(cols: u16, rows: u16, xpix: u16, ypix: u16) -> Option<Badge> {
+    if (cols as u32) < BADGE_COLS + 2 || (rows as u32) < BADGE_ROWS + 2 {
+        return None; // too small a terminal to carry it
+    }
+    let ratio = if xpix > 0 && ypix > 0 { (ypix as f64 / rows as f64) / (xpix as f64 / cols as f64) } else { 2.0 };
+    let ratio = ratio.clamp(1.2, 3.5);
+    let img_w = 64.0;
+    let row_px = img_w / BADGE_COLS as f64 * ratio; // one row, in image pixels (a column is img_w / 4)
+    Some(Badge {
+        col: cols as u32 - BADGE_COLS + 1,
+        cols: BADGE_COLS,
+        rows: BADGE_ROWS,
+        img_w: img_w as u32,
+        img_h: (row_px * BADGE_ROWS as f64).round() as u32,
+        img_top: (row_px * TOP_MARGIN_ROWS).round() as u32,
+    })
 }
 
 fn winsize(fd: RawFd) -> (u16, u16, u16, u16) {
@@ -98,10 +118,6 @@ fn winsize(fd: RawFd) -> (u16, u16, u16, u16) {
     }
 }
 
-fn cols_of(fd: RawFd) -> u16 {
-    winsize(fd).0
-}
-
 fn current_badge(fd: RawFd) -> Option<Badge> {
     let (c, r, x, y) = winsize(fd);
     badge_geometry(c, r, x, y)
@@ -110,19 +126,23 @@ fn current_badge(fd: RawFd) -> Option<Badge> {
 const IMG_ID: u32 = 77;
 const MARKER_ID: u32 = 78;
 
-fn upload_icon(id: u32, rgba: &[u8], px: u32) {
+fn upload_icon(id: u32, rgba: &[u8], w: u32, h: u32) {
     let b64 = crate::icon::base64(rgba);
     let chunks: Vec<&str> = b64.as_bytes().chunks(4096).map(|c| std::str::from_utf8(c).unwrap()).collect();
     for (i, c) in chunks.iter().enumerate() {
         let more = if i + 1 < chunks.len() { 1 } else { 0 };
-        let ctl = if i == 0 { format!("a=t,f=32,s={px},v={px},i={id},q=2,m={more}") } else { format!("m={more}") };
+        let ctl = if i == 0 { format!("a=t,f=32,s={w},v={h},i={id},q=2,m={more}") } else { format!("m={more}") };
         write_all(1, format!("\x1b_G{ctl};{c}\x1b\\").as_bytes());
     }
 }
 
+fn place(id: u32, p: u32, z: u32, b: &Badge) {
+    // save cursor, go to the badge's first cell, place (replace) the image over its block of cells, restore
+    write_all(1, format!("\x1b7\x1b[1;{}H\x1b_Ga=p,i={id},p={p},c={},r={},C=1,z={z},q=2\x1b\\\x1b8", b.col, b.cols, b.rows).as_bytes());
+}
+
 fn draw_icon(b: &Badge) {
-    // save cursor, go to the badge's cell, place (replace) the image at its pixel offset, restore
-    write_all(1, format!("\x1b7\x1b[{};{}H\x1b_Ga=p,i={IMG_ID},p=1,X={},Y={},C=1,z=1000,q=2\x1b\\\x1b8", b.row, b.col, b.xo, b.yo).as_bytes());
+    place(IMG_ID, 1, 1000, b);
 }
 
 /// Splits mouse reports on the badge from everything else in the terminal's input.
@@ -280,7 +300,7 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             // move the badge in the same instant: the old placement stays on its old cell until
             // it is replaced, which showed it at the previous spot for a moment
             if let (Some(_), Some(b)) = (&deco, current_badge(0)) {
-                if uploaded == Some((alt, b.n)) {
+                if uploaded == Some((alt, b.img_h)) {
                     draw_icon(&b);
                 }
             }
@@ -302,10 +322,8 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
             }
             if deco.is_some() {
                 // fallback when the terminal reports no pixel size: the old two-cell badge in row 1
-                let hit = current_badge(0).map(|b| b.hit).unwrap_or_else(|| {
-                    let c = cols_of(0) as u32;
-                    (c.saturating_sub(1), c, 1, 1)
-                });
+                // the cells the badge covers; a terminal too small for it has no badge to click
+                let hit = current_badge(0).map(|b| b.hit()).unwrap_or((0, 0, 0, 0));
                 let f = filter.feed(&buf[..n as usize], hit, editor_mouse);
                 write_all(m, &f.forward);
                 if f.clicked || f.hotkey {
@@ -343,11 +361,11 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         if probe_req && last_out.elapsed() >= Duration::from_millis(25) {
             probe_req = false;
             if let (Some(d), Some(b)) = (&deco, current_badge(0)) {
-                if marker_uploaded != Some((alt, b.n)) {
-                    upload_icon(MARKER_ID, &crate::icon::folder_icon(b.n as usize, crate::icon::marker_fill(d.bg), d.fg, d.ring), b.n);
-                    marker_uploaded = Some((alt, b.n));
+                if marker_uploaded != Some((alt, b.img_h)) {
+                    upload_icon(MARKER_ID, &crate::icon::folder_icon(b.img_w as usize, b.img_h as usize, b.img_top as usize, crate::icon::marker_fill(d.bg), d.fg, d.ring), b.img_w, b.img_h);
+                    marker_uploaded = Some((alt, b.img_h));
                 }
-                write_all(1, format!("\x1b7\x1b[{};{}H\x1b_Ga=p,i={MARKER_ID},p=2,X={},Y={},C=1,z=2000,q=2\x1b\\\x1b8", b.row, b.col, b.xo, b.yo).as_bytes());
+                place(MARKER_ID, 2, 2000, &b);
                 let keep = std::env::var("TUI_SHIM_MARKER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2500); // invisible, so no cost to keeping it up
                 probe_until = Some(Instant::now() + Duration::from_millis(keep));
             }
@@ -367,24 +385,16 @@ pub fn run(sock: &Path, argv: &[String], deco: Option<Deco>) -> Result<i32> {
         let starved = dirty_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(300)) && last_out.elapsed() >= Duration::from_millis(3);
         if dirty && (last_out.elapsed() >= quiet || starved) {
             if let Some(d) = &deco {
-                match current_badge(0) {
-                    Some(b) => {
-                        if uploaded != Some((alt, b.n)) {
-                            // image storage is per screen, and the size follows the font: (re)send
-                            upload_icon(IMG_ID, &crate::icon::folder_icon(b.n as usize, d.bg, d.fg, d.ring), b.n);
-                            uploaded = Some((alt, b.n));
-                        }
-                        draw_icon(&b);
+                if let Some(b) = current_badge(0) {
+                    if uploaded.is_none() {
+                        crate::log(&format!("terminal size: cols/rows/xpix/ypix = {:?}, badge = {b:?}", winsize(0)));
                     }
-                    None => {
-                        // no pixel size known: two cells wide, one tall, in the corner
-                        if uploaded != Some((alt, 0)) {
-                            upload_icon(IMG_ID, &crate::icon::folder_icon(64, d.bg, d.fg, d.ring), 64);
-                            uploaded = Some((alt, 0));
-                        }
-                        let col = cols_of(0).saturating_sub(1).max(1);
-                        write_all(1, format!("\x1b7\x1b[1;{col}H\x1b_Ga=p,i={IMG_ID},p=1,c=2,r=1,C=1,z=1000,q=2\x1b\\\x1b8").as_bytes());
+                    if uploaded != Some((alt, b.img_h)) {
+                        // image storage is per screen, and the picture's shape follows the cell shape: (re)send
+                        upload_icon(IMG_ID, &crate::icon::folder_icon(b.img_w as usize, b.img_h as usize, b.img_top as usize, d.bg, d.fg, d.ring), b.img_w, b.img_h);
+                        uploaded = Some((alt, b.img_h));
                     }
+                    draw_icon(&b);
                 }
             }
             dirty = false;
@@ -411,15 +421,30 @@ mod tests {
     const HIT: (u32, u32, u32, u32) = (79, 80, 1, 2);
 
     #[test]
-    fn badge_geometry_keeps_a_half_cell_gap_to_the_top_and_right() {
-        // 80x24 cells of 10x20 px
+    fn badge_covers_whole_cells_in_the_top_right_corner() {
+        // 80x24 cells of 10x20 px (the pixel numbers only give the cell shape)
         let b = badge_geometry(80, 24, 800, 480).unwrap();
-        assert_eq!(b.n, 32); // 1.6 cells tall
-        let (x, y) = ((b.col - 1) * 10 + b.xo, (b.row - 1) * 20 + b.yo);
-        assert_eq!(800 - (x + b.n), 10, "10px from the right edge");
-        assert_eq!(y, 10, "10px from the top edge");
-        assert!(b.hit.0 <= b.col && b.hit.1 >= 80 - 2 && b.hit.2 == 1);
-        assert!(badge_geometry(80, 24, 0, 0).is_none());
+        assert_eq!((b.col, b.cols, b.rows), (77, 4, 3));
+        assert_eq!(b.hit(), (77, 80, 1, 3), "the click zone covers the cells the picture covers");
+        // the picture has the aspect of the block: 4 cells x 10px by 3 cells x 20px
+        assert_eq!((b.img_w, b.img_h), (64, 96));
+        assert_eq!(b.img_top, 10, "a third of a row (about 0.3 x 32px) above the circle");
+    }
+
+    #[test]
+    fn display_scale_does_not_change_the_badge() {
+        // the same terminal reported with pixel sizes 1.25^2 too large (what ghostty does at scale 1.25)
+        let honest = badge_geometry(135, 48, 1568, 1191).unwrap();
+        let inflated = badge_geometry(135, 48, 2444, 1854).unwrap();
+        assert_eq!((honest.col, honest.cols, honest.rows), (inflated.col, inflated.cols, inflated.rows));
+        assert!((honest.img_h as i32 - inflated.img_h as i32).abs() <= 1, "only the ratio matters");
+    }
+
+    #[test]
+    fn tiny_terminals_get_no_badge() {
+        assert!(badge_geometry(5, 3, 50, 60).is_none());
+        // no pixel sizes at all: cells are assumed twice as tall as wide
+        assert_eq!(badge_geometry(80, 24, 0, 0).unwrap().img_h, 96);
     }
 
     #[test]
