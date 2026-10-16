@@ -28,6 +28,14 @@ tui-shim niri-rule            # optional window-rule snippet (not needed by the 
 tui-shim doctor
 ```
 
+## In Simple Linux
+[Simple Linux](https://github.com/tarilka0gg/simple-linux) ships it: the fish setup runs `tui-shim shims install` and
+`TUI_SHIM_LINE_ICONS=1 tui-shim sync --no-theme --offline` once per user (line-drawn launcher icons: Noctalia turns coloured or
+filled theme icons into black squares; `--no-theme` because Noctalia colours btop and yazi itself; `--offline` because icons are generated).
+The palette comes from the wallpaper: a Noctalia hook (`colors.d/30-tui-shim.sh` in
+[simple-linux-configs](https://github.com/tarilka0gg/simple-linux-configs)) rewrites `~/.config/tui-shim/palette.md` after every palette change, colours micro from it
+and redraws the icons. The installer copies the `tui-shim` binary into the installed system. Details for packagers: [docs/INTEGRATION.md](docs/INTEGRATION.md).
+
 ## Several copies of one program
 `~/.cargo/bin/yazi` next to `/usr/bin/yazi`: `scan`/`list` show every distinct copy (merged-usr symlinks are
 deduplicated). Without a saved choice the first one in lookup order wins. `choose` stores your pick in
