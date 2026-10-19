@@ -9,6 +9,37 @@ opens by itself. Enabled by `tui-shim shims install` (puts `micro`/`nvim` shims 
 The picker's filter ignores case (`DEsktop` finds `Desktop`, `desktop`, `DeSKtop`...), ranks exact and prefix matches first and
 searches sub-folders too. Details, limits and the design rationale are in `docs/INTEGRATION.md`.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><a href="docs/img/badge.png"><img src="docs/img/badge.png" alt="micro in ghostty with the round folder badge in the corner" width="100%"></a></td>
+    <td width="50%"><a href="docs/img/picker.png"><img src="docs/img/picker.png" alt="The file picker, a floating window over the editor" width="100%"></a></td>
+  </tr>
+  <tr>
+    <td><b>Folder badge</b><br><sub>micro and nvim get a small round folder badge in the window's top-right corner; click it or press F9.</sub></td>
+    <td><b>File picker</b><br><sub>A native browser with folders and files; Enter opens the file in the same editor window.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/img/picker-search.png"><img src="docs/img/picker-search.png" alt="The picker's search finds files in sub-folders too" width="100%"></a></td>
+    <td width="50%"><a href="docs/img/launcher.png"><img src="docs/img/launcher.png" alt="Launcher entries with line-drawn icons: btop, Edit in terminal, micro, tmux" width="100%"></a></td>
+  </tr>
+  <tr>
+    <td><b>Search</b><br><sub>Case-insensitive; exact and prefix matches first; sub-folders are searched too.</sub></td>
+    <td><b>Launcher entries</b><br><sub>One entry per TUI app, with an icon and its own window class, plus Edit in terminal...</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/img/cli.png"><img src="docs/img/cli.png" alt="scan, shims status and doctor in a terminal" width="100%"></a></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td><b>Command line</b><br><sub>tui-shim scan, shims status and doctor.</sub></td>
+    <td></td>
+  </tr>
+</table>
+
+<sub>Taken in the Simple Linux live session in a virtual machine; click a picture to see it full-size.</sub>
+
 Scans for known TUI apps (btop, htop, yazi, micro, nvim, tmux, ...), then for each one:
 
 - writes a launcher `.desktop` entry that opens it in your terminal with its own window class
