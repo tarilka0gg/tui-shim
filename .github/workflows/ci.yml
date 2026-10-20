@@ -1,0 +1,16 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # the launcher/theme tooling; the GTK picker needs GTK 4, libadwaita and gtk4-layer-shell and is built by hand
+      - name: Build (no GTK)
+        run: cargo build --locked --no-default-features
+      - name: Tests (no GTK)
+        run: cargo test --locked --no-default-features

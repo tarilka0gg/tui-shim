@@ -1,5 +1,7 @@
 # tui-shim
 
+[![CI](https://github.com/tarilka0gg/tui-shim/actions/workflows/ci.yml/badge.svg)](https://github.com/tarilka0gg/tui-shim/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/tarilka0gg/tui-shim)](LICENSE) [![Changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue)](CHANGELOG.md)
+
 > **Integrating this into Simple Linux / the ISO? Read [docs/INTEGRATION.md](docs/INTEGRATION.md) first.**
 > It explains how everything works, what must not be forgotten and how to package it.
 
@@ -85,6 +87,10 @@ Config files tui-shim edits are backed up once as `*.bak-tui-shim`; files not cr
 Rust 2024 edition. GTK4, libadwaita and gtk4-layer-shell (for the picker) are optional: `cargo build --release --no-default-features`
 builds the launcher/theme tooling without them. The badge needs a terminal with the kitty graphics protocol (ghostty, kitty);
 opening the picker next to a scrolled niri window uses `grim`. A Gentoo live ebuild is in `packaging/gentoo/`.
+
+## Changelog
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 GPL-3.0-or-later, see [LICENSE](LICENSE). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
